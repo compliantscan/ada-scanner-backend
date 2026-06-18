@@ -1,0 +1,106 @@
+const { createClient } = require('@supabase/supabase-js');
+
+// Initialize Supabase client
+const supabaseUrl = process.env.SUPABASE_URL;
+const supabaseKey = process.env.SUPABASE_ANON_KEY;
+
+if (!supabaseUrl || !supabaseKey) {
+  console.error('Missing Supabase credentials in environment variables');
+  console.error('Required: SUPABASE_URL and SUPABASE_ANON_KEY');
+  process.exit(1);
+}
+
+const supabase = createClient(supabaseUrl, supabaseKey);
+
+/**
+ * Save scan results to Supabase "scans" table
+ * @param {string} url - The URL that was scanned
+ * @param {object} results - Full axe-core results object
+ * @param {string} userEmail - User email (optional for anonymous scans)
+ * @returns {Promise<object>} - Database record
+ */
+async function saveScanResults(url, results, userEmail = null) {
+  try {
+    console.log(`[DB] Saving scan results for ${url}`);
+
+    // Prepare summary data
+    const violationsBySeverity = {
+      critical: results.violations.filter(v => v.impact === 'critical').length,
+      serious: results.violations.filter(v => v.impact === 'serious').length,
+      moderate: results.violations.filter(v => v.impact === 'moderate').length,
+      minor: results.violations.filter(v => v.impact === 'minor').length,
+    };
+
+    // Insert into scans table
+    const { data, error } = await supabase.from('scans').insert([
+      {
+        url,
+        user_email: userEmail,
+        total_violations: results.violations.length,
+        violations_by_severity: violationsBySeverity,
+        results_json: results,
+        created_at: new Date().toISOString(),
+      },
+    ]);
+
+    if (error) {
+      console.error('[DB] Error saving scan results:', error);
+      throw error;
+    }
+
+    console.log(`[DB] Scan results saved successfully`);
+    return data;
+  } catch (error) {
+    console.error('[DB] Failed to save scan results:', error.message);
+    throw error;
+  }
+}
+
+/**
+ * Get all scans for a user (requires auth)
+ * @param {string} userEmail - User email
+ * @returns {Promise<array>} - Array of scans
+ */
+async function getUserScans(userEmail) {
+  try {
+    const { data, error } = await supabase
+      .from('scans')
+      .select('*')
+      .eq('user_email', userEmail)
+      .order('created_at', { ascending: false });
+
+    if (error) throw error;
+    return data;
+  } catch (error) {
+    console.error('[DB] Failed to fetch user scans:', error.message);
+    throw error;
+  }
+}
+
+/**
+ * Get a specific scan result
+ * @param {number} scanId - Scan ID
+ * @returns {Promise<object>} - Scan record
+ */
+async function getScanById(scanId) {
+  try {
+    const { data, error } = await supabase
+      .from('scans')
+      .select('*')
+      .eq('id', scanId)
+      .single();
+
+    if (error) throw error;
+    return data;
+  } catch (error) {
+    console.error('[DB] Failed to fetch scan:', error.message);
+    throw error;
+  }
+}
+
+module.exports = {
+  saveScanResults,
+  getUserScans,
+  getScanById,
+  supabase,
+};
