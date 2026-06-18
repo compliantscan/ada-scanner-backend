@@ -31,8 +31,8 @@ async function saveScanResults(url, results, userEmail = null) {
       minor: results.violations.filter(v => v.impact === 'minor').length,
     };
 
-    // Insert into scans table
-    const { data, error } = await supabase.from('scans').insert([
+    // Insert into scans table (attempt full insert)
+    const attempt = await supabase.from('scans').insert([
       {
         url,
         user_email: userEmail,
@@ -43,13 +43,40 @@ async function saveScanResults(url, results, userEmail = null) {
       },
     ]);
 
-    if (error) {
-      console.error('[DB] Error saving scan results:', error);
-      throw error;
+    console.log('[DB] Supabase insert attempt result:', {
+      status: attempt.status,
+      data: attempt.data ? attempt.data.length && attempt.data[0] ? '[record]' : attempt.data : attempt.data,
+      error: attempt.error,
+    });
+
+    if (attempt.error) {
+      // If schema cache / missing column error, try a minimal insert as a fallback
+      const msg = attempt.error.message || '';
+      if (attempt.error.code === 'PGRST204' || /Could not find the/.test(msg)) {
+        console.warn('[DB] Schema mismatch detected; attempting minimal insert');
+        const fallback = await supabase.from('scans').insert([
+          {
+            url,
+            user_email: userEmail,
+            results_json: results,
+          },
+        ]);
+        console.log('[DB] Supabase fallback insert result:', {
+          status: fallback.status,
+          data: fallback.data,
+          error: fallback.error,
+        });
+        if (fallback.error) {
+          throw fallback.error;
+        }
+        return fallback.data;
+      }
+
+      throw attempt.error;
     }
 
     console.log(`[DB] Scan results saved successfully`);
-    return data;
+    return attempt.data;
   } catch (error) {
     console.error('[DB] Failed to save scan results:', error.message);
     throw error;

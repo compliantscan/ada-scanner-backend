@@ -21,6 +21,10 @@ CREATE INDEX IF NOT EXISTS scans_url_idx ON scans(url);
 -- Enable RLS (Row Level Security) - optional, for multi-user support
 ALTER TABLE scans ENABLE ROW LEVEL SECURITY;
 
+-- Drop existing policies if they exist
+DROP POLICY IF EXISTS "Allow public scans" ON scans;
+DROP POLICY IF EXISTS "Users can read their own scans" ON scans;
+
 -- Create policy to allow anyone to insert (for free tier)
 CREATE POLICY "Allow public scans" ON scans
   FOR INSERT
