@@ -107,6 +107,33 @@ async function saveScanResults(url, results, userEmail = null) {
 }
 
 /**
+ * Save a collected email to Supabase "emails_collected" table
+ * @param {string} email
+ * @param {string} url
+ * @returns {Promise<object>}
+ */
+async function saveCollectedEmail(email, url) {
+  try {
+    const { data, error } = await supabase.from('emails_collected').insert([
+      {
+        email,
+        url_scanned: url,
+        created_at: new Date().toISOString(),
+      },
+    ]).select();
+
+    if (error) {
+      throw error;
+    }
+
+    return data;
+  } catch (error) {
+    console.error('[DB] Failed to save collected email:', error.message);
+    throw error;
+  }
+}
+
+/**
  * Get all scans for a user (requires auth)
  * @param {string} userEmail - User email
  * @returns {Promise<array>} - Array of scans
@@ -150,6 +177,7 @@ async function getScanById(scanId) {
 
 module.exports = {
   saveScanResults,
+  saveCollectedEmail,
   getUserScans,
   getScanById,
   supabase,

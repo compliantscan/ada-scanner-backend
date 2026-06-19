@@ -4,7 +4,9 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const { scanUrl } = require('./scanner');
-const { saveScanResults } = require('./db');
+const { saveScanResults, saveCollectedEmail, getScanById } = require('./db');
+const { sendReportEmail } = require('./email');
+const { generateReportPdf } = require('./report');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -91,6 +93,64 @@ app.post('/scan', async (req, res) => {
     console.error('Scan error:', error);
     return res.status(500).json({
       error: 'Scan failed',
+      message: error.message,
+    });
+  }
+});
+
+app.post('/collect-email', async (req, res) => {
+  try {
+    const { email, url, scanResult } = req.body;
+
+    if (!email || !url || !scanResult) {
+      return res.status(400).json({
+        error: 'Missing data',
+        message: 'Email, url, and scanResult are required.',
+      });
+    }
+
+    // Persist the email capture
+    await saveCollectedEmail(email, url);
+
+    // Send PDF report to the captured email
+    await sendReportEmail(email, scanResult, url);
+
+    return res.json({ success: true, message: 'Email saved and report emailed.' });
+  } catch (error) {
+    console.error('Email collection error:', error);
+    return res.status(500).json({
+      error: 'Unable to send report',
+      message: error.message,
+    });
+  }
+});
+
+app.post('/generate-report', async (req, res) => {
+  try {
+    const { scanId } = req.body;
+    if (!scanId) {
+      return res.status(400).json({
+        error: 'Missing scanId',
+        message: 'Please provide a scanId in the request body.',
+      });
+    }
+
+    const scanData = await getScanById(scanId);
+    if (!scanData) {
+      return res.status(404).json({
+        error: 'Scan not found',
+        message: 'No scan found for the provided scanId.',
+      });
+    }
+
+    const pdfBuffer = await generateReportPdf(scanData);
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="ada-scan-report-${scanId}.pdf"`);
+    return res.send(pdfBuffer);
+  } catch (error) {
+    console.error('Generate report error:', error);
+    return res.status(500).json({
+      error: 'Unable to generate report',
       message: error.message,
     });
   }
