@@ -46,7 +46,18 @@ app.post('/scan', async (req, res) => {
     console.log(`[${new Date().toISOString()}] Scanning: ${url}`);
     
     // Run the scan
-    const results = await scanUrl(url);
+    let results;
+    try {
+      results = await scanUrl(url);
+    } catch (scanError) {
+      if (scanError.name === 'ScanError') {
+        return res.status(scanError.httpStatus || 400).json({
+          error: scanError.name,
+          message: scanError.message,
+        });
+      }
+      throw scanError;
+    }
 
     // Save results to Supabase (best-effort)
     let savedRecord = null;

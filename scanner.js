@@ -1,6 +1,31 @@
 const { chromium } = require('playwright');
 const { AxeBuilder } = require('@axe-core/playwright');
 
+class ScanError extends Error {
+  constructor(message, status = 400) {
+    super(message);
+    this.name = 'ScanError';
+    this.httpStatus = status;
+  }
+}
+
+function classifyPlaywrightError(error) {
+  const msg = error.message || '';
+  if (msg.includes('ERR_NAME_NOT_RESOLVED') || msg.includes('ERR_NAME_RESOLUTION_FAILED')) {
+    return new ScanError('site unreachable', 400);
+  }
+  if (msg.includes('ERR_CONNECTION_REFUSED') || msg.includes('ERR_CONNECTION_RESET')) {
+    return new ScanError('site unreachable', 400);
+  }
+  if (msg.includes('ERR_CERT') || msg.includes('SSL')) {
+    return new ScanError('invalid URL or SSL issue', 400);
+  }
+  if (msg.includes('Navigation timeout') || msg.includes('Timeout') || msg.includes('timeout')) {
+    return new ScanError('timed out while loading the site', 504);
+  }
+  return new ScanError('unable to load the site', 400);
+}
+
 async function scanUrl(url) {
   let browser;
   try {
@@ -13,7 +38,7 @@ async function scanUrl(url) {
     
     // Navigate to URL
     console.log('Loading page...');
-    await page.goto(url, { waitUntil: 'networkidle' });
+    await page.goto(url, { waitUntil: 'networkidle', timeout: 30000 });
     
     // Run axe-core scan
     console.log('Running accessibility scan...');
@@ -48,7 +73,10 @@ async function scanUrl(url) {
     return results;
   } catch (error) {
     console.error('Error during scan:', error.message);
-    throw error;
+    if (error.name === 'ScanError') {
+      throw error;
+    }
+    throw classifyPlaywrightError(error);
   } finally {
     if (browser) {
       await browser.close();
