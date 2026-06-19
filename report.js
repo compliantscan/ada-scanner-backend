@@ -6,7 +6,7 @@ async function getFixSuggestion(violation) {
   const model = process.env.GEMINI_MODEL || 'gemini-1.5';
 
   if (!apiKey) {
-    throw new Error('Missing GEMINI_API_KEY environment variable for AI fix suggestions.');
+    return 'AI fix suggestion unavailable because GEMINI_API_KEY is not configured.';
   }
 
   const brokenElement = violation.nodes && violation.nodes.length ? violation.nodes[0].target.join(', ') : 'Unknown element';
@@ -14,48 +14,57 @@ async function getFixSuggestion(violation) {
 
   const prompt = `You are a web accessibility expert. Fix the broken HTML below and provide a one-sentence plain-English explanation.\n\nWCAG criterion: ${violation.id}\nBroken HTML element: ${brokenElement}\nBroken HTML snippet:\n${htmlSnippet}\n\nOutput format exactly as:\nCorrected HTML:\n<corrected html>\nFix explanation:\n<one-sentence explanation>`;
 
-  const response = await fetch(endpoint, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      model,
-      input: prompt,
-      max_output_tokens: 300,
-    }),
-  });
+  try {
+    const response = await fetch(endpoint, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model,
+        input: prompt,
+        max_output_tokens: 300,
+      }),
+    });
 
-  const result = await response.json();
-  if (!response.ok) {
-    const message = result.error?.message || JSON.stringify(result);
-    throw new Error(`AI request failed: ${message}`);
-  }
-
-  let text = '';
-  if (result.output) {
-    const output = Array.isArray(result.output) ? result.output[0] : result.output;
-    if (output?.content) {
-      const content = Array.isArray(output.content) ? output.content : [output.content];
-      const textPart = content.find((item) => item.type === 'output_text');
-      text = textPart?.text || content[0]?.text || '';
+    const result = await response.json();
+    if (!response.ok) {
+      const message = result.error?.message || JSON.stringify(result);
+      return `AI fix suggestion unavailable: ${message}`;
     }
-  }
-  if (!text && result.choices?.[0]?.message?.content) {
-    text = result.choices[0].message.content;
-  }
-  if (!text && result.choices?.[0]?.text) {
-    text = result.choices[0].text;
-  }
 
-  return text.trim() || 'AI fix suggestion unavailable.';
+    let text = '';
+    if (result.output) {
+      const output = Array.isArray(result.output) ? result.output[0] : result.output;
+      if (output?.content) {
+        const content = Array.isArray(output.content) ? output.content : [output.content];
+        const textPart = content.find((item) => item.type === 'output_text');
+        text = textPart?.text || content[0]?.text || '';
+      }
+    }
+    if (!text && result.choices?.[0]?.message?.content) {
+      text = result.choices[0].message.content;
+    }
+    if (!text && result.choices?.[0]?.text) {
+      text = result.choices[0].text;
+    }
+
+    return text.trim() || 'AI fix suggestion unavailable.';
+  } catch (error) {
+    return `AI fix suggestion unavailable: ${error.message}`;
+  }
 }
 
 async function enrichViolationsWithFixes(violations) {
   return Promise.all(
     violations.map(async (violation) => {
-      const fixSuggestion = await getFixSuggestion(violation);
+      let fixSuggestion = 'AI fix suggestion unavailable.';
+      try {
+        fixSuggestion = await getFixSuggestion(violation);
+      } catch (error) {
+        fixSuggestion = `AI fix suggestion unavailable: ${error.message}`;
+      }
       return { ...violation, fixSuggestion };
     })
   );

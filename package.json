@@ -1,29 +1,27 @@
 {
-    "name":  "backend",
-    "version":  "1.0.0",
-    "description":  "",
-    "main":  "server.js",
-    "scripts":  {
-                    "start":  "node server.js",
-                    "test":  "echo \"Error: no test specified\" \u0026\u0026 exit 1",
-                    "postinstall":  "playwright install --with-deps chromium"
-                },
-    "keywords":  [
-
-                 ],
-    "author":  "",
-    "license":  "ISC",
-    "type":  "commonjs",
-    "dependencies":  {
-                         "@axe-core/playwright":  "^4.11.3",
-                         "@supabase/supabase-js":  "^2.108.2",
-                         "axe-core":  "^4.12.1",
-                         "cors": "^2.8.5",
-                         "dotenv":  "^17.4.2",
-                         "express":  "^5.2.1",
-                         "nodemailer": "^6.9.5",
-                         "pdfkit": "^0.14.0",
-                         "playwright":  "^1.61.0",
-                         "puppeteer": "^21.3.8"
-                     }
+    "name": "backend",
+    "version": "1.0.0",
+    "description": "",
+    "main": "server.js",
+    "scripts": {
+        "start": "node server.js",
+        "test": "echo \"Error: no test specified\" && exit 1",
+        "postinstall": "playwright install --with-deps chromium"
+    },
+    "keywords": [],
+    "author": "",
+    "license": "ISC",
+    "type": "commonjs",
+    "dependencies": {
+        "@axe-core/playwright": "^4.11.3",
+        "@supabase/supabase-js": "^2.108.2",
+        "axe-core": "^4.12.1",
+        "cors": "^2.8.6",
+        "dotenv": "^17.4.2",
+        "express": "^5.2.1",
+        "nodemailer": "^6.9.5",
+        "pdfkit": "^0.14.0",
+        "playwright": "^1.61.0",
+        "puppeteer": "^21.11.0"
+    }
 }

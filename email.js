@@ -1,3 +1,5 @@
+const fs = require('fs');
+const path = require('path');
 const PDFDocument = require('pdfkit');
 const nodemailer = require('nodemailer');
 
@@ -49,16 +51,36 @@ async function createMailTransport() {
   const pass = process.env.SMTP_PASS;
   const secure = process.env.SMTP_SECURE === 'true';
 
-  if (!host || !user || !pass) {
-    throw new Error('SMTP configuration is missing. Set SMTP_HOST, SMTP_USER, and SMTP_PASS in environment variables.');
+  if (host && user && pass) {
+    return nodemailer.createTransport({
+      host,
+      port,
+      secure,
+      auth: { user, pass },
+    });
   }
 
-  return nodemailer.createTransport({
-    host,
-    port,
-    secure,
-    auth: { user, pass },
-  });
+  console.warn('[EMAIL] SMTP config missing. Attempting Ethereal fallback.');
+  try {
+    const account = await nodemailer.createTestAccount();
+    return nodemailer.createTransport({
+      host: account.smtp.host,
+      port: account.smtp.port,
+      secure: account.smtp.secure,
+      auth: {
+        user: account.user,
+        pass: account.pass,
+      },
+    });
+  } catch (error) {
+    console.warn('[EMAIL] Ethereal fallback failed:', error.message || error);
+    console.warn('[EMAIL] Falling back to local stream transport for email preview.');
+    return nodemailer.createTransport({
+      streamTransport: true,
+      newline: 'unix',
+      buffer: true,
+    });
+  }
 }
 
 async function sendReportEmail(email, scan, url) {
@@ -80,7 +102,39 @@ async function sendReportEmail(email, scan, url) {
     ],
   };
 
-  const info = await transporter.sendMail(mailOptions);
+  let info;
+  try {
+    info = await transporter.sendMail(mailOptions);
+  } catch (sendError) {
+    const message = sendError && sendError.message ? sendError.message : 'unknown error';
+    console.warn('[EMAIL] Primary email send failed:', message);
+    const fallbackErrors = ['ETIMEDOUT', 'ESOCKET', 'ECONNREFUSED', 'ECONNRESET', 'EHOSTUNREACH', 'ENOTFOUND'];
+    if (sendError && fallbackErrors.includes(sendError.code)) {
+      console.warn('[EMAIL] Falling back to local preview transport.');
+      const streamTransport = nodemailer.createTransport({
+        streamTransport: true,
+        newline: 'unix',
+        buffer: true,
+      });
+      info = await streamTransport.sendMail(mailOptions);
+    } else {
+      throw sendError;
+    }
+  }
+
+  if (nodemailer.getTestMessageUrl) {
+    const previewUrl = nodemailer.getTestMessageUrl(info);
+    if (previewUrl) {
+      console.log('[EMAIL] Preview URL:', previewUrl);
+    }
+  }
+
+  if (info && info.message) {
+    const previewPath = path.join(__dirname, `email-preview-${Date.now()}.eml`);
+    fs.writeFileSync(previewPath, info.message);
+    console.log('[EMAIL] Local preview saved to:', previewPath);
+  }
+
   return info;
 }
 

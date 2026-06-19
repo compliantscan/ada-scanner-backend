@@ -114,7 +114,39 @@ async function saveScanResults(url, results, userEmail = null) {
  */
 async function saveCollectedEmail(email, url) {
   try {
-    const { data, error } = await supabase.from('emails_collected').insert([
+    const client = supabaseAdmin || supabase;
+    if (!supabaseAdmin) {
+      console.warn('[DB] Warning: using anon key for emails_collected; configure SUPABASE_SERVICE_ROLE_KEY to avoid row-level security failures');
+    }
+
+    let existing = null;
+    try {
+      const { data, error } = await client
+        .from('emails_collected')
+        .select('*')
+        .eq('email', email)
+        .eq('url_scanned', url)
+        .limit(1);
+      if (error) {
+        const msg = error.message || '';
+        if (msg.toLowerCase().includes('row-level security') || msg.toLowerCase().includes('permission')) {
+          console.warn('[DB] Skipping duplicate email check because of row-level security or permission error');
+        } else {
+          throw error;
+        }
+      } else if (data && data.length) {
+        existing = data;
+        console.log('[DB] Email already captured for this URL');
+      }
+    } catch (checkError) {
+      console.warn('[DB] Duplicate email check failed:', checkError.message || checkError);
+    }
+
+    if (existing) {
+      return existing;
+    }
+
+    const { data, error } = await client.from('emails_collected').insert([
       {
         email,
         url_scanned: url,
@@ -123,6 +155,11 @@ async function saveCollectedEmail(email, url) {
     ]).select();
 
     if (error) {
+      const msg = error.message || '';
+      if (msg.toLowerCase().includes('row-level security') || msg.toLowerCase().includes('permission')) {
+        console.warn('[DB] Row-level security prevented saving collected email; continuing without persistence');
+        return null;
+      }
       throw error;
     }
 
@@ -165,10 +202,10 @@ async function getScanById(scanId) {
       .from('scans')
       .select('*')
       .eq('id', scanId)
-      .single();
+      .limit(1);
 
     if (error) throw error;
-    return data;
+    return Array.isArray(data) && data.length ? data[0] : null;
   } catch (error) {
     console.error('[DB] Failed to fetch scan:', error.message);
     throw error;

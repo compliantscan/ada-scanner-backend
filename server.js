@@ -15,6 +15,14 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
+function isValidEmail(value) {
+  return typeof value === 'string' && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value);
+}
+
+function isReasonableString(value, maxLength = 2048) {
+  return typeof value === 'string' && value.trim().length > 0 && value.length <= maxLength;
+}
+
 // Health check endpoint
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', message: 'API is running' });
@@ -120,10 +128,22 @@ app.post('/collect-email', async (req, res) => {
       });
     }
 
-    // Persist the email capture
+    if (!isValidEmail(email) || email.length > 254) {
+      return res.status(400).json({
+        error: 'Invalid email',
+        message: 'Please provide a valid email address.',
+      });
+    }
+
+    if (!isReasonableString(url, 2048) || typeof scanResult !== 'object') {
+      return res.status(400).json({
+        error: 'Invalid request',
+        message: 'URL and scanResult must be valid.',
+      });
+    }
+
     await saveCollectedEmail(email, url);
 
-    // Send PDF report to the captured email
     await sendReportEmail(email, scanResult, url);
 
     return res.json({ success: true, message: 'Email saved and report emailed.' });
@@ -139,14 +159,14 @@ app.post('/collect-email', async (req, res) => {
 app.post('/generate-report', async (req, res) => {
   try {
     const { scanId } = req.body;
-    if (!scanId) {
+    if (!scanId || Number.isNaN(Number(scanId))) {
       return res.status(400).json({
         error: 'Missing scanId',
-        message: 'Please provide a scanId in the request body.',
+        message: 'Please provide a valid numeric scanId in the request body.',
       });
     }
 
-    const scanData = await getScanById(scanId);
+    const scanData = await getScanById(Number(scanId));
     if (!scanData) {
       return res.status(404).json({
         error: 'Scan not found',
