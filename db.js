@@ -11,6 +11,12 @@ if (!supabaseUrl || !supabaseKey) {
 }
 
 const supabase = createClient(supabaseUrl, supabaseKey);
+// Optionally create an admin client using the service role key for server-side writes
+const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY || null;
+let supabaseAdmin = null;
+if (serviceRoleKey) {
+  supabaseAdmin = createClient(supabaseUrl, serviceRoleKey);
+}
 
 /**
  * Save scan results to Supabase "scans" table
@@ -31,8 +37,12 @@ async function saveScanResults(url, results, userEmail = null) {
       minor: results.violations.filter(v => v.impact === 'minor').length,
     };
 
-    // Insert into scans table (attempt full insert)
-    const attempt = await supabase.from('scans').insert([
+    // Choose client: prefer admin (service_role) client for server-side writes
+    const client = supabaseAdmin || supabase;
+    if (!supabaseAdmin) console.warn('[DB] Warning: using anon key for inserts; consider setting SUPABASE_SERVICE_ROLE_KEY');
+
+    // Insert into scans table (attempt full insert) and request returned row(s)
+    const attempt = await client.from('scans').insert([
       {
         url,
         user_email: userEmail,
@@ -41,13 +51,9 @@ async function saveScanResults(url, results, userEmail = null) {
         results_json: results,
         created_at: new Date().toISOString(),
       },
-    ]);
+    ]).select();
 
-    console.log('[DB] Supabase insert attempt result:', {
-      status: attempt.status,
-      data: attempt.data ? attempt.data.length && attempt.data[0] ? '[record]' : attempt.data : attempt.data,
-      error: attempt.error,
-    });
+    console.log('[DB] Supabase insert attempt result:', { status: attempt.status, data: attempt.data, error: attempt.error });
 
     if (attempt.error) {
       // If schema cache / missing column error, try a minimal insert as a fallback
@@ -60,7 +66,7 @@ async function saveScanResults(url, results, userEmail = null) {
             user_email: userEmail,
             results_json: results,
           },
-        ]);
+        ]).select();
         console.log('[DB] Supabase fallback insert result:', {
           status: fallback.status,
           data: fallback.data,
@@ -73,6 +79,23 @@ async function saveScanResults(url, results, userEmail = null) {
       }
 
       throw attempt.error;
+    }
+
+    // If insert returned no body (data null or empty), try to fetch the recently inserted row
+    if (!attempt.data || (Array.isArray(attempt.data) && attempt.data.length === 0)) {
+      console.warn('[DB] Insert returned no row; attempting to fetch recent row for URL');
+      const { data: recent, error: recentError } = await supabase
+        .from('scans')
+        .select('*')
+        .eq('url', url)
+        .order('created_at', { ascending: false })
+        .limit(1);
+      if (recentError) {
+        console.error('[DB] Error fetching recent row after insert:', recentError);
+      } else if (recent && recent.length) {
+        console.log('[DB] Found recent row after insert:', recent[0]);
+        return recent;
+      }
     }
 
     console.log(`[DB] Scan results saved successfully`);
