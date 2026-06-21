@@ -1,216 +1,7 @@
 const puppeteer = require('puppeteer');
 
-async function getFixSuggestion(violation) {
-  const apiKey = process.env.GEMINI_API_KEY;
-  const endpoint = process.env.GEMINI_API_ENDPOINT || 'https://api.openai.com/v1/responses';
-  const model = process.env.GEMINI_MODEL || 'gemini-1.5';
-
-  if (!apiKey) {
-    return 'AI fix suggestion unavailable because GEMINI_API_KEY is not configured.';
-  }
-
-  const brokenElement = violation.nodes && violation.nodes.length ? violation.nodes[0].target.join(', ') : 'Unknown element';
-  const htmlSnippet = violation.nodes && violation.nodes.length ? violation.nodes[0].html : 'No HTML snippet available.';
-
-  const prompt = `You are a web accessibility expert. Fix the broken HTML below and provide a one-sentence plain-English explanation.\n\nWCAG criterion: ${violation.id}\nBroken HTML element: ${brokenElement}\nBroken HTML snippet:\n${htmlSnippet}\n\nOutput format exactly as:\nCorrected HTML:\n<corrected html>\nFix explanation:\n<one-sentence explanation>`;
-
-  try {
-    const response = await fetch(endpoint, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model,
-        input: prompt,
-        max_output_tokens: 300,
-      }),
-    });
-
-    const result = await response.json();
-    if (!response.ok) {
-      const message = result.error?.message || JSON.stringify(result);
-      return `AI fix suggestion unavailable: ${message}`;
-    }
-
-    let text = '';
-    if (result.output) {
-      const output = Array.isArray(result.output) ? result.output[0] : result.output;
-      if (output?.content) {
-        const content = Array.isArray(output.content) ? output.content : [output.content];
-        const textPart = content.find((item) => item.type === 'output_text');
-        text = textPart?.text || content[0]?.text || '';
-      }
-    }
-    if (!text && result.choices?.[0]?.message?.content) {
-      text = result.choices[0].message.content;
-    }
-    if (!text && result.choices?.[0]?.text) {
-      text = result.choices[0].text;
-    }
-
-    return text.trim() || 'AI fix suggestion unavailable.';
-  } catch (error) {
-    return `AI fix suggestion unavailable: ${error.message}`;
-  }
-}
-
-async function enrichViolationsWithFixes(violations) {
-  return Promise.all(
-    violations.map(async (violation) => {
-      let fixSuggestion = 'AI fix suggestion unavailable.';
-      try {
-        fixSuggestion = await getFixSuggestion(violation);
-      } catch (error) {
-        fixSuggestion = `AI fix suggestion unavailable: ${error.message}`;
-      }
-      return { ...violation, fixSuggestion };
-    })
-  );
-}
-
-function renderReportHtml(scanRecord) {
-  const scan = scanRecord.results_json || {};
-  const url = scanRecord.url || 'Unknown URL';
-  const totalViolations = Array.isArray(scan.violations) ? scan.violations.length : 0;
-  const totalPasses = Array.isArray(scan.passes) ? scan.passes.length : 0;
-
-  const severityCounts = {
-    critical: 0,
-    serious: 0,
-    moderate: 0,
-    minor: 0,
-  };
-
-  const violations = Array.isArray(scan.violations) ? scan.violations : [];
-  violations.forEach((v) => {
-    const impact = v.impact || 'unknown';
-    if (severityCounts[impact] !== undefined) {
-      severityCounts[impact] += 1;
-    }
-  });
-
-  const severityRows = Object.entries(severityCounts)
-    .map(([level, count]) => `
-      <div class="severity-row">
-        <span class="severity-label">${level.charAt(0).toUpperCase() + level.slice(1)}</span>
-        <span class="severity-count">${count}</span>
-      </div>
-    `)
-    .join('');
-
-  const violationRows = violations.map((violation, index) => {
-    const element = violation.nodes && violation.nodes.length ? violation.nodes[0].target.join(', ') : 'Unknown element';
-    const failureSummary = violation.nodes && violation.nodes.length ? violation.nodes[0].failureSummary : '';
-    const htmlSnippet = violation.nodes && violation.nodes.length ? violation.nodes[0].html : '';
-    const fixSuggestion = violation.fixSuggestion || 'Fix suggestion unavailable.';
-
-    return `
-      <div class="violation-card">
-        <div class="violation-header">
-          <div>
-            <span class="violation-rank">#${index + 1}</span>
-            <span class="violation-id">${violation.id}</span>
-          </div>
-          <span class="violation-impact ${violation.impact}">${violation.impact || 'unknown'}</span>
-        </div>
-        <div class="violation-body">
-          <p><strong>WCAG criterion:</strong> ${violation.id}</p>
-          <p><strong>Description:</strong> ${violation.description || 'No description provided.'}</p>
-          <p><strong>Why it matters:</strong> ${violation.help || 'No help text provided.'}</p>
-          <p><strong>Element that failed:</strong> ${element}</p>
-          <p><strong>Failure summary:</strong> ${failureSummary}</p>
-          <div class="html-snippet"><strong>HTML snippet:</strong><pre>${escapeHtml(htmlSnippet)}</pre></div>
-          <div class="fix-suggestion"><strong>How to fix this:</strong><p>${escapeHtml(fixSuggestion)}</p></div>
-        </div>
-      </div>
-    `;
-  }).join('');
-
-  return `
-    <!doctype html>
-    <html lang="en">
-      <head>
-        <meta charset="utf-8" />
-        <title>ADA Scan Report</title>
-        <style>
-          body { font-family: Inter, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; margin: 0; padding: 24px; color: #111827; background: #f8fafc; }
-          .report-shell { max-width: 900px; margin: 0 auto; background: #ffffff; padding: 32px; border-radius: 24px; box-shadow: 0 30px 80px rgba(15,23,42,0.08); }
-          .logo { font-size: 1rem; letter-spacing: 0.18em; text-transform: uppercase; color: #2563eb; font-weight: 700; margin-bottom: 16px; }
-          .hero { display: flex; flex-direction: column; gap: 6px; }
-          .hero h1 { margin: 0; font-size: 2.3rem; line-height: 1.05; }
-          .hero p { margin: 0; color: #475569; font-size: 1rem; }
-          .meta { margin-top: 20px; display: grid; gap: 12px; grid-template-columns: repeat(3, minmax(0, 1fr)); }
-          .meta-card { padding: 18px; border-radius: 18px; background: #f1f5f9; }
-          .meta-card strong { display: block; font-size: 0.86rem; margin-bottom: 8px; color: #0f172a; }
-          .meta-card span { font-size: 1.8rem; font-weight: 700; color: #0f172a; }
-          .section-title { margin: 40px 0 18px; font-size: 1.35rem; color: #0f172a; }
-          .severity-summary { display: grid; gap: 10px; }
-          .severity-row { display: flex; justify-content: space-between; align-items: center; padding: 16px 18px; border-radius: 16px; background: #eef2ff; }
-          .severity-row span { font-weight: 700; }
-          .violation-card { margin-bottom: 18px; padding: 20px; border-radius: 20px; border: 1px solid #e2e8f0; background: #ffffff; }
-          .violation-header { display: flex; justify-content: space-between; align-items: flex-start; gap: 10px; flex-wrap: wrap; margin-bottom: 14px; }
-          .violation-rank { display: inline-block; font-weight: 700; margin-right: 12px; color: #2563eb; }
-          .violation-id { font-size: 1.05rem; font-weight: 700; color: #0f172a; }
-          .violation-impact { text-transform: uppercase; font-size: 0.82rem; letter-spacing: 0.08em; padding: 8px 12px; border-radius: 999px; color: white; }
-          .violation-impact.critical { background: #dc2626; }
-          .violation-impact.serious { background: #f97316; }
-          .violation-impact.moderate { background: #facc15; color: #0f172a; }
-          .violation-impact.minor { background: #14b8a6; }
-          .violation-body p { margin: 8px 0; line-height: 1.5; }
-          .html-snippet pre { white-space: pre-wrap; word-wrap: break-word; background: #f8fafc; padding: 12px; border-radius: 14px; overflow-x: auto; font-size: 0.9rem; }
-          .fix-suggestion { margin-top: 12px; padding: 14px; border-radius: 16px; background: #f8fafc; border: 1px solid #e2e8f0; }
-          .fix-suggestion p { margin: 6px 0 0; }
-        </style>
-      </head>
-      <body>
-        <div class="report-shell">
-          <div class="logo">ADA Scanner</div>
-          <div class="hero">
-            <h1>Accessibility scan report</h1>
-            <p>${escapeHtml(url)}</p>
-          </div>
-
-          <div class="meta">
-            <div class="meta-card"><strong>Scan ID</strong><span>${scanRecord.id}</span></div>
-            <div class="meta-card"><strong>Total violations</strong><span>${totalViolations}</span></div>
-            <div class="meta-card"><strong>Total passes</strong><span>${totalPasses}</span></div>
-          </div>
-
-          <div class="section-title">Severity summary</div>
-          <div class="severity-summary">${severityRows}</div>
-
-          <div class="section-title">Violations</div>
-          ${violationRows}
-        </div>
-      </body>
-    </html>
-  `;
-}
-
-async function generateReportPdf(scanRecord) {
-  const scan = scanRecord.results_json || {};
-  if (Array.isArray(scan.violations) && scan.violations.length) {
-    scan.violations = await enrichViolationsWithFixes(scan.violations);
-  }
-  const html = renderReportHtml({ ...scanRecord, results_json: scan });
-  const browser = await puppeteer.launch({ args: ['--no-sandbox', '--disable-setuid-sandbox'] });
-  const page = await browser.newPage();
-  await page.setContent(html, { waitUntil: 'networkidle0' });
-  const pdfBuffer = await page.pdf({
-    format: 'A4',
-    printBackground: true,
-    margin: { top: '20mm', right: '20mm', bottom: '20mm', left: '20mm' },
-  });
-  await browser.close();
-  return pdfBuffer;
-}
-
 function escapeHtml(value) {
-  if (!value) return '';
-  return value
-    .toString()
+  return String(value ?? '')
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
@@ -218,6 +9,104 @@ function escapeHtml(value) {
     .replace(/'/g, '&#39;');
 }
 
-module.exports = {
-  generateReportPdf,
-};
+function severityColor(severity) {
+  return { critical: '#dc2626', serious: '#d97706', moderate: '#ca8a04', minor: '#64748b' }[severity] || '#64748b';
+}
+
+function renderPaidReportHtml(report) {
+  const brandName = escapeHtml(report.branding?.name || 'ADA Scanner');
+  const logo = report.branding?.logoUrl
+    ? `<img src="${escapeHtml(report.branding.logoUrl)}" alt="${brandName}" class="brand-logo-img">`
+    : `<span class="brand-mark">A</span><span>${brandName}</span>`;
+  const violations = report.violations.map(item => `
+    <article class="violation-card">
+      <header>
+        <div>
+          <p class="wcag">WCAG 2.1 AA ${escapeHtml(item.wcag.id)} · ${escapeHtml(item.wcag.name)}</p>
+          <h3>${escapeHtml(item.title)}</h3>
+        </div>
+        <span class="severity" style="background:${severityColor(item.severity)}">${escapeHtml(item.severity)}</span>
+      </header>
+      <p>${escapeHtml(item.description)}</p>
+      <div class="meta-grid">
+        <div><strong>Affected elements</strong><span>${item.affectedElements}</span></div>
+        <div><strong>Source</strong><span>${item.sourceDetected ? `${escapeHtml(item.filePath || 'Unknown file')}:${escapeHtml(item.lineNumber || '?')}` : 'Runtime DOM — source line not detectable'}</span></div>
+        <div><strong>Effort</strong><span>${escapeHtml(item.fix.effort)}</span></div>
+      </div>
+      <p class="code-label">Element HTML snippet</p>
+      <pre>${escapeHtml(item.elementHtml || 'No HTML snippet captured.')}</pre>
+      <div class="fix-box">
+        <h4>${item.fix.aiGenerated ? 'AI-generated fix' : 'Suggested fix'}</h4>
+        <div class="replace-grid">
+          <div><strong>Replace this</strong><pre>${escapeHtml(item.fix.replaceThis || item.elementHtml || 'Current implementation')}</pre></div>
+          <div><strong>With this</strong><pre>${escapeHtml(item.fix.withThis)}</pre></div>
+        </div>
+        <p>${escapeHtml(item.fix.explanation)}</p>
+      </div>
+    </article>
+  `).join('');
+
+  const priorities = report.priorityChecklist.map(item => `
+    <li><strong>#${item.rank} ${escapeHtml(item.title)}</strong><span>${item.riskReductionPerHour} risk-reduction pts/hr · ${item.estimatedMinutes} min</span></li>
+  `).join('');
+  const pages = report.pages.map(page => `<tr><td>${escapeHtml(page.url)}</td><td>${page.violations}</td><td>${page.density}/page</td></tr>`).join('');
+  const badge = report.complianceBadgeHtml ? `<pre>${escapeHtml(report.complianceBadgeHtml)}</pre>` : '<p class="muted">Available on Pro and Business plans.</p>';
+
+  return `<!doctype html>
+  <html>
+    <head>
+      <meta charset="utf-8">
+      <title>${escapeHtml(report.reportId)}</title>
+      <style>
+        * { box-sizing: border-box; } body { margin: 0; font-family: Inter, Arial, sans-serif; color: #111827; background: #f8fafc; }
+        .page { padding: 38px 42px; page-break-after: always; } .page:last-child { page-break-after: auto; }
+        .cover { min-height: 970px; color: white; background: linear-gradient(135deg, #0b1220, #172554); }
+        .brand { display: flex; gap: 10px; align-items: center; font-weight: 800; letter-spacing: .04em; }
+        .brand-mark { display: inline-flex; align-items: center; justify-content: center; width: 28px; height: 28px; border-radius: 8px; background: #2563eb; }
+        .brand-logo-img { max-height: 34px; max-width: 180px; object-fit: contain; }
+        .label { margin-top: 110px; color: #93c5fd; font-weight: 800; font-size: 12px; letter-spacing: .16em; text-transform: uppercase; }
+        h1 { margin: 16px 0 0; font-size: 42px; line-height: 1.05; letter-spacing: -.04em; } h2 { margin: 0 0 18px; font-size: 28px; } h3 { margin: 4px 0 0; font-size: 18px; }
+        .cover-url { margin-top: 18px; font-size: 22px; color: #dbeafe; word-break: break-word; }
+        .stat-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; margin-top: 80px; }
+        .stat { padding: 20px; border-radius: 18px; background: rgba(255,255,255,.1); } .stat span { display:block; color:#cbd5e1; font-size: 11px; text-transform: uppercase; letter-spacing: .12em; } .stat strong { display:block; margin-top: 10px; font-size: 26px; }
+        .summary-grid { display:grid; grid-template-columns: repeat(4, 1fr); gap: 14px; margin: 22px 0; } .summary-card { padding: 18px; border-radius: 16px; background: white; border: 1px solid #e2e8f0; } .summary-card span { color: #64748b; font-size: 11px; font-weight: 800; text-transform: uppercase; } .summary-card strong { display:block; margin-top: 8px; font-size: 22px; }
+        .callout { padding: 20px; border-radius: 18px; background: #fef2f2; border: 1px solid #fecaca; } .muted { color: #64748b; }
+        .checklist { padding-left: 20px; } .checklist li { margin: 0 0 12px; } .checklist span { display:block; color:#64748b; font-size: 13px; }
+        .violation-card { margin: 0 0 22px; padding: 22px; background: white; border: 1px solid #dce3ea; border-radius: 18px; break-inside: avoid; } .violation-card header { display:flex; justify-content:space-between; gap:18px; }
+        .severity { align-self: flex-start; padding: 7px 12px; border-radius: 999px; color: white; font-weight: 800; font-size: 11px; text-transform: uppercase; } .wcag { margin:0; color:#2563eb; font-size: 11px; font-weight:800; text-transform:uppercase; }
+        .meta-grid { display:grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin: 16px 0; } .meta-grid div { padding: 12px; border-radius: 12px; background: #f8fafc; } .meta-grid strong { display:block; font-size: 11px; color:#64748b; text-transform:uppercase; } .meta-grid span { display:block; margin-top:6px; font-size:12px; }
+        pre { white-space: pre-wrap; word-break: break-word; margin: 8px 0 0; padding: 12px; border-radius: 12px; background: #0f172a; color: #e2e8f0; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 11px; }
+        .code-label { margin: 18px 0 0; color:#64748b; font-weight:800; font-size: 11px; text-transform: uppercase; }
+        .fix-box { margin-top: 16px; padding: 16px; border-radius: 14px; background: #f0fdf4; border: 1px solid #bbf7d0; } .fix-box h4 { margin:0 0 10px; color:#15803d; } .fix-box pre { background: #ecfdf5; color: #14532d; border: 1px solid #bbf7d0; }
+        .replace-grid { display:grid; grid-template-columns: 1fr 1fr; gap: 12px; } table { width: 100%; border-collapse: collapse; background: white; border-radius: 16px; overflow: hidden; } th, td { padding: 13px; border-bottom: 1px solid #e2e8f0; text-align: left; font-size: 13px; } th { background: #eff6ff; color: #1d4ed8; }
+      </style>
+    </head>
+    <body>
+      <section class="page cover"><div class="brand">${logo}</div><p class="label">Paid ADA compliance report</p><h1>Consultant-grade accessibility audit</h1><p class="cover-url">${escapeHtml(report.url)}</p><div class="stat-grid"><div class="stat"><span>Score</span><strong>${report.executiveSummary.score} / ${report.executiveSummary.grade}</strong></div><div class="stat"><span>Risk</span><strong>${escapeHtml(report.executiveSummary.riskLevel)}</strong></div><div class="stat"><span>Report ID</span><strong style="font-size:17px">${escapeHtml(report.reportId)}</strong></div></div></section>
+      <section class="page"><h2>Executive summary</h2><div class="summary-grid"><div class="summary-card"><span>Score</span><strong>${report.executiveSummary.score}</strong></div><div class="summary-card"><span>Risk level</span><strong>${escapeHtml(report.executiveSummary.riskLevel)}</strong></div><div class="summary-card"><span>Settlement range</span><strong>${report.executiveSummary.settlementRange}</strong></div><div class="summary-card"><span>Estimated fix time</span><strong>${escapeHtml(report.executiveSummary.estimatedFixTime)}</strong></div></div><div class="callout"><strong>Use fear responsibly:</strong> settlement risk belongs next to a path forward. Start with the top three fixes below, then work through the detailed findings by severity.</div><h2 style="margin-top:32px">Priority checklist</h2><ol class="checklist">${priorities}</ol><h2 style="margin-top:32px">Trend</h2><p>${escapeHtml(report.trend.summary)}</p></section>
+      <section class="page"><h2>Page-by-page breakdown</h2><table><thead><tr><th>Page scanned</th><th>Violations</th><th>Density</th></tr></thead><tbody>${pages}</tbody></table><h2 style="margin-top:32px">Compliance badge</h2>${badge}</section>
+      <section class="page"><h2>Full violation list</h2>${violations}</section>
+    </body>
+  </html>`;
+}
+
+async function generatePaidReportPdf(report) {
+  const html = renderPaidReportHtml(report);
+  const browser = await puppeteer.launch({ args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+  try {
+    const page = await browser.newPage();
+    await page.setContent(html, { waitUntil: 'networkidle0' });
+    return await page.pdf({
+      format: 'A4',
+      printBackground: true,
+      displayHeaderFooter: true,
+      headerTemplate: `<div style="font-family:Arial,sans-serif;font-size:8px;color:#64748b;width:100%;padding:0 38px;">${escapeHtml(report.branding?.name || 'ADA Scanner')} · ${escapeHtml(report.reportId)}</div>`,
+      footerTemplate: '<div style="font-family:Arial,sans-serif;font-size:8px;color:#64748b;width:100%;padding:0 38px;text-align:right;">Page <span class="pageNumber"></span> of <span class="totalPages"></span></div>',
+      margin: { top: '18mm', right: '14mm', bottom: '18mm', left: '14mm' },
+    });
+  } finally {
+    await browser.close();
+  }
+}
+
+module.exports = { escapeHtml, generatePaidReportPdf, renderPaidReportHtml };

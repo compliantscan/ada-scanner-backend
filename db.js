@@ -1,3 +1,5 @@
+require('dotenv').config();
+
 const { createClient } = require('@supabase/supabase-js');
 
 // Initialize Supabase client
@@ -25,7 +27,7 @@ if (serviceRoleKey) {
  * @param {string} userEmail - User email (optional for anonymous scans)
  * @returns {Promise<object>} - Database record
  */
-async function saveScanResults(url, results, userEmail = null) {
+async function saveScanResults(url, results, userEmail = null, metadata = {}) {
   try {
     console.log(`[DB] Saving scan results for ${url}`);
 
@@ -49,6 +51,9 @@ async function saveScanResults(url, results, userEmail = null) {
         total_violations: results.violations.length,
         violations_by_severity: violationsBySeverity,
         results_json: results,
+        score: metadata.score ?? null,
+        access_key_hash: metadata.accessKeyHash || null,
+        free_report_expires_at: metadata.freeReportExpiresAt || null,
         created_at: new Date().toISOString(),
       },
     ]).select();
@@ -198,7 +203,8 @@ async function getUserScans(userEmail) {
  */
 async function getScanById(scanId) {
   try {
-    const { data, error } = await supabase
+    const client = supabaseAdmin || supabase;
+    const { data, error } = await client
       .from('scans')
       .select('*')
       .eq('id', scanId)
@@ -212,10 +218,81 @@ async function getScanById(scanId) {
   }
 }
 
+async function getScanHistory(url, userEmail, limit = 20) {
+  const client = supabaseAdmin || supabase;
+  let query = client
+    .from('scans')
+    .select('id,url,user_email,score,results_json,created_at')
+    .eq('url', url)
+    .order('created_at', { ascending: true })
+    .limit(limit);
+  if (userEmail) query = query.eq('user_email', userEmail);
+  const { data, error } = await query;
+  if (error) throw error;
+  return data || [];
+}
+
+async function getActiveSubscriptionByTokenHash(tokenHash) {
+  if (!supabaseAdmin) throw new Error('Paid reports require SUPABASE_SERVICE_ROLE_KEY.');
+  const { data, error } = await supabaseAdmin
+    .from('subscriptions')
+    .select('*')
+    .eq('access_token_hash', tokenHash)
+    .eq('status', 'active')
+    .limit(1);
+  if (error) throw error;
+  const subscription = data?.[0] || null;
+  if (subscription?.current_period_end && new Date(subscription.current_period_end) <= new Date()) return null;
+  return subscription;
+}
+
+async function claimScanForSubscriber(scanId, userEmail) {
+  if (!supabaseAdmin) throw new Error('Paid reports require SUPABASE_SERVICE_ROLE_KEY.');
+  const { data, error } = await supabaseAdmin
+    .from('scans')
+    .update({ user_email: userEmail, updated_at: new Date().toISOString() })
+    .eq('id', scanId)
+    .is('user_email', null)
+    .select();
+  if (error) throw error;
+  return data?.[0] || null;
+}
+
+async function getCachedAiFix(fingerprint) {
+  if (!supabaseAdmin) return null;
+  const { data, error } = await supabaseAdmin
+    .from('ai_fix_cache')
+    .select('result_json')
+    .eq('fingerprint', fingerprint)
+    .limit(1);
+  if (error) {
+    console.warn('[DB] AI cache lookup failed:', error.message);
+    return null;
+  }
+  return data?.[0]?.result_json || null;
+}
+
+async function saveCachedAiFix(fingerprint, criterion, result) {
+  if (!supabaseAdmin) return null;
+  const { error } = await supabaseAdmin.from('ai_fix_cache').upsert({
+    fingerprint,
+    criterion,
+    result_json: result,
+    updated_at: new Date().toISOString(),
+  });
+  if (error) console.warn('[DB] AI cache write failed:', error.message);
+  return result;
+}
+
 module.exports = {
   saveScanResults,
   saveCollectedEmail,
   getUserScans,
   getScanById,
+  getScanHistory,
+  getActiveSubscriptionByTokenHash,
+  claimScanForSubscriber,
+  getCachedAiFix,
+  saveCachedAiFix,
   supabase,
 };

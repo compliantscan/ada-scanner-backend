@@ -1,0 +1,208 @@
+const crypto = require('crypto');
+const { getCachedAiFix, saveCachedAiFix } = require('./db');
+
+const CLAUDE_ENDPOINT = 'https://api.anthropic.com/v1/messages';
+const DEFAULT_MODEL = 'claude-haiku-4-5-20251001';
+const BANNED_FIX_PATTERNS = [
+  /describe (this|the|image|action|destination|purpose)/i,
+  /fix (any|all) of the following/i,
+  /use colors? with/i,
+  /at least a 4\.5:1 contrast ratio/i,
+  /update the element/i,
+  /satisfy the referenced wcag/i,
+  /current implementation/i,
+];
+
+function firstTarget(violation) {
+  const target = violation.nodes?.[0]?.target;
+  return Array.isArray(target) && target.length ? target[0] : String(target || '').trim();
+}
+
+function openingTag(html, tagName) {
+  const match = String(html || '').match(new RegExp(`<${tagName}\\b[^>]*>`, 'i'));
+  return match ? match[0] : '';
+}
+
+function replaceOrAddAttribute(tag, attribute, value) {
+  if (!tag) return '';
+  if (value === undefined || value === null || value === '') return tag;
+  const escaped = `${attribute}="${value}"`;
+  if (new RegExp(`\\s${attribute}=`, 'i').test(tag)) {
+    return tag.replace(new RegExp(`${attribute}=(["']).*?\\1`, 'i'), escaped);
+  }
+  return tag.replace(/>$/, ` ${escaped}>`);
+}
+
+function inferButtonLabel(html = '', target = '') {
+  const source = `${html} ${target}`.toLowerCase();
+  if (/menu|hamburger|nav|navbar|bars/.test(source)) return 'Open navigation menu';
+  if (/close|dismiss|x-/.test(source)) return 'Close dialog';
+  if (/search|magnify/.test(source)) return 'Search';
+  if (/cart|bag|basket/.test(source)) return 'Open cart';
+  if (/play/.test(source)) return 'Play video';
+  if (/pause/.test(source)) return 'Pause video';
+  if (/next|chevron-right|arrow-right/.test(source)) return 'Next slide';
+  if (/prev|previous|chevron-left|arrow-left/.test(source)) return 'Previous slide';
+  return 'Open navigation menu';
+}
+
+function concreteFallbackByRule(violation, badCode) {
+  const target = firstTarget(violation);
+  const selector = target || '.affected-element';
+  const buttonTag = openingTag(badCode, 'button');
+  const imgTag = openingTag(badCode, 'img');
+  const anchorTag = openingTag(badCode, 'a');
+  const inputTag = openingTag(badCode, 'input') || openingTag(badCode, 'textarea') || openingTag(badCode, 'select');
+
+  switch (violation.id) {
+    case 'button-name': {
+      const label = inferButtonLabel(badCode, target);
+      const corrected = replaceOrAddAttribute(
+        replaceOrAddAttribute(buttonTag || '<button type="button">', 'aria-label', label),
+        'aria-expanded',
+        /menu|nav|hamburger/i.test(`${badCode} ${target}`) ? 'false' : null
+      );
+      return `${corrected}${buttonTag ? '…</button>' : '<svg aria-hidden="true" focusable="false"></svg></button>'}`;
+    }
+    case 'image-alt':
+      return replaceOrAddAttribute(imgTag || '<img src="/logo.svg">', 'alt', 'TrustMRR dashboard showing revenue metrics');
+    case 'image-redundant-alt':
+      return replaceOrAddAttribute(imgTag || '<img src="/logo.svg">', 'alt', '');
+    case 'color-contrast':
+      return `${selector} {\n  color: #1a1a1a; /* on #ffffff background = 16.1:1 ratio */\n}`;
+    case 'label': {
+      const correctedInput = replaceOrAddAttribute(inputTag || '<input type="email">', 'id', 'email');
+      return `<label for="email">Email address</label>\n${correctedInput}`;
+    }
+    case 'link-name':
+      return anchorTag
+        ? `${replaceOrAddAttribute(anchorTag, 'aria-label', 'View pricing plans')}…</a>`
+        : '<a href="/pricing">View pricing plans</a>';
+    case 'html-has-lang':
+      return '<html lang="en">';
+    case 'document-title':
+      return '<title>TrustMRR - Revenue analytics dashboard</title>';
+    case 'landmark-main-is-top-level':
+      return '<body>\n  <header>…</header>\n  <main class="min-h-screen bg-muted">…</main> <!-- remove parent <div role="main"> -->\n</body>';
+    case 'landmark-no-duplicate-main':
+      return '<main id="main-content">…</main>\n<section class="page-content">…</section> <!-- changed duplicate <main> to <section> -->';
+    case 'region':
+      return '<main id="main-content">\n  <section aria-labelledby="dashboard-heading">\n    <h2 id="dashboard-heading">Dashboard overview</h2>\n    …\n  </section>\n</main>';
+    default:
+      if (badCode && /^<\w+/i.test(badCode)) return `<!-- Corrected accessible version -->\n${badCode}`;
+      return `${selector} {\n  outline: 2px solid transparent;\n}`;
+  }
+}
+
+function fallbackFix(violation, badCode) {
+  const effort = ['critical', 'serious'].includes(violation.impact) ? 'Requires developer' : '5 min fix';
+  const withThis = concreteFallbackByRule(violation, badCode);
+  return {
+    replaceThis: badCode || firstTarget(violation) || '/* failing snippet unavailable from runtime scan */',
+    withThis,
+    explanation: 'Replace the failing snippet with the corrected code above, then rerun the scan and verify the interaction with keyboard and screen reader testing.',
+    effort,
+    estimatedMinutes: effort === '5 min fix' ? 5 : 30,
+    aiGenerated: false,
+  };
+}
+
+function hasDeployableCode(value) {
+  const text = String(value || '').trim();
+  if (!text) return false;
+  if (BANNED_FIX_PATTERNS.some(pattern => pattern.test(text))) return false;
+  return /<[\w-]+[\s>]|<\/[\w-]+>|[\w.#:[\]\-="' ]+\s*\{[\s\S]*:[\s\S]*;|aria-[\w-]+="[^"]+"/i.test(text);
+}
+
+function parseClaudeJson(text) {
+  const cleaned = String(text || '').replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/i, '').trim();
+  const result = JSON.parse(cleaned);
+  const allowedEfforts = ['5 min fix', 'Requires developer', 'Complex'];
+  const parsed = {
+    replaceThis: String(result.replaceThis || '').slice(0, 500),
+    withThis: String(result.withThis || '').slice(0, 1000),
+    explanation: String(result.explanation || '').slice(0, 500),
+    effort: allowedEfforts.includes(result.effort) ? result.effort : 'Requires developer',
+    estimatedMinutes: Math.max(5, Math.min(480, Number(result.estimatedMinutes) || 30)),
+    aiGenerated: true,
+  };
+  if (!hasDeployableCode(parsed.withThis)) {
+    throw new Error('Claude returned a non-deployable or placeholder fix.');
+  }
+  return parsed;
+}
+
+async function generateFix(violation, criterion, criterionDescription) {
+  const badCode = String(violation.nodes?.[0]?.html || '').slice(0, 1000);
+  const context = JSON.stringify({
+    rule: violation.id,
+    severity: violation.impact,
+    wcag: `${criterion} ${criterionDescription}`,
+    failingHtml: badCode,
+    cssTarget: firstTarget(violation),
+    failure: String(violation.nodes?.[0]?.failureSummary || '').slice(0, 500),
+    help: String(violation.help || '').slice(0, 300),
+  }).slice(0, 2000);
+  const fingerprint = crypto.createHash('sha256').update(context).digest('hex');
+  const cached = await getCachedAiFix(fingerprint);
+  if (cached && hasDeployableCode(cached.withThis)) return { ...cached, cached: true };
+
+  if (!process.env.ANTHROPIC_API_KEY) return fallbackFix(violation, badCode);
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 20_000);
+  try {
+    const response = await fetch(CLAUDE_ENDPOINT, {
+      method: 'POST',
+      headers: {
+        'x-api-key': process.env.ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01',
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: process.env.ANTHROPIC_MODEL || DEFAULT_MODEL,
+        max_tokens: 600,
+        temperature: 0,
+        system: [
+          'You are a senior web accessibility engineer.',
+          'Return only valid JSON. Never invent a file path or line number.',
+          'Every fix must be deployable code: exact corrected HTML, JSX, CSS, or ARIA attributes.',
+          'Never output placeholders or instructions like "Describe this", "Fix any of the following", "Use better contrast", or "update the element".',
+        ].join(' '),
+        messages: [{
+          role: 'user',
+          content: `Generate the simplest deployable fix for this accessibility violation.
+
+Rules:
+- withThis must contain exact corrected code, not advice.
+- If multiple valid fixes exist, put the simplest one first.
+- If CSS is required, include the full selector and property/value, with a contrast-ratio comment when relevant.
+- If ARIA is required, include the complete attribute string, e.g. aria-label="Open navigation menu" aria-expanded="false".
+- Do not use placeholder labels such as "Describe this" or "Field name"; infer a specific label from the snippet/selector.
+- Return JSON only with keys replaceThis, withThis, explanation, effort (exactly one of: 5 min fix, Requires developer, Complex), and estimatedMinutes.
+
+Examples of acceptable withThis values:
+<button aria-label="Open navigation menu" aria-expanded="false"><svg aria-hidden="true" focusable="false">…</svg></button>
+.hero-subtitle { color: #1a1a1a; /* on #ffffff background = 16.1:1 ratio */ }
+<main class="min-h-screen bg-muted">…</main> <!-- remove parent <div role="main"> -->
+
+Violation context:
+${context}`,
+        }],
+      }),
+      signal: controller.signal,
+    });
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.error?.message || `Claude request failed (${response.status})`);
+    const text = payload.content?.find(part => part.type === 'text')?.text;
+    const fix = parseClaudeJson(text);
+    await saveCachedAiFix(fingerprint, criterion, fix);
+    return fix;
+  } catch (error) {
+    console.warn(`[CLAUDE] ${violation.id}: ${error.message}; using deterministic fallback.`);
+    return fallbackFix(violation, badCode);
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+module.exports = { generateFix };

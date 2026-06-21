@@ -13,10 +13,44 @@ CREATE TABLE IF NOT EXISTS scans (
   updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
+-- Safe to run against an existing installation.
+ALTER TABLE scans ADD COLUMN IF NOT EXISTS score INTEGER;
+ALTER TABLE scans ADD COLUMN IF NOT EXISTS access_key_hash TEXT;
+ALTER TABLE scans ADD COLUMN IF NOT EXISTS free_report_expires_at TIMESTAMP WITH TIME ZONE;
+
 -- Add indexes for faster queries
 CREATE INDEX IF NOT EXISTS scans_user_email_idx ON scans(user_email);
 CREATE INDEX IF NOT EXISTS scans_created_at_idx ON scans(created_at DESC);
 CREATE INDEX IF NOT EXISTS scans_url_idx ON scans(url);
+CREATE INDEX IF NOT EXISTS scans_access_key_hash_idx ON scans(access_key_hash);
+
+-- Billing providers should provision one row after a successful subscription.
+-- Store only a SHA-256 hash of the report access token; never store the raw token.
+CREATE TABLE IF NOT EXISTS subscriptions (
+  id BIGSERIAL PRIMARY KEY,
+  user_email TEXT NOT NULL,
+  plan TEXT NOT NULL CHECK (plan IN ('starter', 'pro', 'business')),
+  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'past_due', 'canceled', 'expired')),
+  access_token_hash TEXT NOT NULL UNIQUE,
+  customer_logo_url TEXT,
+  current_period_end TIMESTAMP WITH TIME ZONE,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+  updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS subscriptions_email_idx ON subscriptions(user_email);
+CREATE INDEX IF NOT EXISTS subscriptions_token_idx ON subscriptions(access_token_hash);
+ALTER TABLE subscriptions ENABLE ROW LEVEL SECURITY;
+
+-- AI fixes are cached by a fingerprint of rule + failing markup.
+CREATE TABLE IF NOT EXISTS ai_fix_cache (
+  fingerprint TEXT PRIMARY KEY,
+  criterion TEXT NOT NULL,
+  result_json JSONB NOT NULL,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+  updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+ALTER TABLE ai_fix_cache ENABLE ROW LEVEL SECURITY;
 
 -- Enable RLS (Row Level Security) - optional, for multi-user support
 ALTER TABLE scans ENABLE ROW LEVEL SECURITY;
@@ -34,3 +68,6 @@ CREATE POLICY "Allow public scans" ON scans
 CREATE POLICY "Users can read their own scans" ON scans
   FOR SELECT
   USING (user_email = auth.email() OR user_email IS NULL);
+
+-- subscriptions and ai_fix_cache intentionally have no public policies.
+-- Backend access requires SUPABASE_SERVICE_ROLE_KEY.
