@@ -82,9 +82,10 @@ async function buildReport(scanRecord, options = {}) {
   const capabilities = options.capabilities || planCapabilities(options.subscription?.plan || 'pro');
   const enriched = await mapWithConcurrency(violations, 3, async violation => {
     const criterion = criterionId(violation);
+    const criterionName = criterionDescription(criterion);
     const firstNode = violation.nodes[0] || {};
     const source = detectedSource(firstNode);
-    const fix = await generateFix(violation, criterion, criterionDescription(criterion));
+    const fix = await generateFix({ ...violation, _criterion: criterion, _criterionName: criterionName }, criterion, criterionName);
     return {
       ruleId: violation.id,
       severity: violation.impact,

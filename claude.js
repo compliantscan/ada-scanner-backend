@@ -97,15 +97,38 @@ function concreteFallbackByRule(violation, badCode) {
 function fallbackFix(violation, badCode) {
   const effort = ['critical', 'serious'].includes(violation.impact) ? 'Requires developer' : '5 min fix';
   const withThis = concreteFallbackByRule(violation, badCode);
+  const help = String(violation.help || '').trim();
+  const description = String(violation.description || '').trim();
+  const criterion = violation._criterion || '';
+  const criterionName = violation._criterionName || '';
+
+  // Build a dynamic explanation: why it violates + what the impact is
+  const violationReason = help || description;
+  const wcagRef = criterion ? ` This breaks WCAG 2.1 AA criterion ${criterion}${criterionName ? ` (${criterionName})` : ''}.` : '';
+
+  let impact = '';
+  if (violation.impact === 'critical') {
+    impact = ' Users who rely on assistive technology cannot access this content at all.';
+  } else if (violation.impact === 'serious') {
+    impact = ' This creates a serious barrier for screen reader and keyboard-only users.';
+  } else if (violation.impact === 'moderate') {
+    impact = ' This makes the experience confusing or difficult for users with disabilities.';
+  } else {
+    impact = ' This may cause minor friction for users of assistive technology.';
+  }
+
+  const explanation = `${violationReason}${wcagRef}${impact}`;
+
   return {
     replaceThis: badCode || firstTarget(violation) || '/* failing snippet unavailable from runtime scan */',
     withThis,
-    explanation: 'Replace the failing snippet with the corrected code above, then rerun the scan and verify the interaction with keyboard and screen reader testing.',
+    explanation,
     effort,
     estimatedMinutes: effort === '5 min fix' ? 5 : 30,
     aiGenerated: false,
   };
 }
+
 
 function hasDeployableCode(value) {
   const text = String(value || '').trim();

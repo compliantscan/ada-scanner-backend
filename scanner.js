@@ -20,6 +20,9 @@ function classifyPlaywrightError(error) {
   if (msg.includes('ERR_CERT') || msg.includes('SSL')) {
     return new ScanError('invalid URL or SSL issue', 400);
   }
+  if (msg.includes('ERR_NETWORK_CHANGED') || msg.includes('ERR_INTERNET_DISCONNECTED')) {
+    return new ScanError('network connection interrupted - please retry', 503);
+  }
   if (msg.includes('Navigation timeout') || msg.includes('Timeout') || msg.includes('timeout')) {
     return new ScanError('timed out while loading the site', 504);
   }
@@ -31,26 +34,53 @@ async function scanUrl(url) {
   try {
     console.log(`Starting scan of: ${url}`);
     
-    // Launch headless Chromium
-    browser = await chromium.launch();
-    const context = await browser.newContext();
+    browser = await chromium.launch({ 
+      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
+      headless: true
+    });
+    
+    const context = await browser.newContext({ 
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36',
+      bypassCSP: true,
+      ignoreHTTPSErrors: true
+    });
+    
     const page = await context.newPage();
+    page.setDefaultNavigationTimeout(90000);
     
-    // Navigate to URL
     console.log('Loading page...');
-    await page.goto(url, { waitUntil: 'networkidle', timeout: 30000 });
+    let navSuccess = false;
+    const strategies = [
+      { waitUntil: 'domcontentloaded', timeout: 45000 },
+      { waitUntil: 'load', timeout: 60000 },
+      { waitUntil: 'networkidle', timeout: 90000 }
+    ];
     
-    // Run axe-core scan
+    for (const strategy of strategies) {
+      try {
+        await page.goto(url, strategy);
+        navSuccess = true;
+        console.log(`Loaded with ${strategy.waitUntil}`);
+        break;
+      } catch (navErr) {
+        console.warn(`${strategy.waitUntil} failed:`, navErr.message);
+      }
+    }
+    
+    if (!navSuccess) {
+      throw new ScanError('unable to load the site after multiple attempts', 504);
+    }
+    
+    await page.waitForTimeout(2000);
+    
     console.log('Running accessibility scan...');
     const results = await new AxeBuilder({ page }).analyze();
     
-    // Print results
     console.log('\n========== SCAN RESULTS ==========\n');
     console.log(`URL: ${url}`);
     console.log(`Total Violations: ${results.violations.length}`);
     console.log(`Passes: ${results.passes.length}`);
     
-    // Group by severity
     const bySeverity = {};
     results.violations.forEach(v => {
       bySeverity[v.impact] = (bySeverity[v.impact] || 0) + 1;

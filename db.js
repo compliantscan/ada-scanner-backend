@@ -140,7 +140,7 @@ async function saveCollectedEmail(email, url) {
           throw error;
         }
       } else if (data && data.length) {
-        existing = data;
+        existing = data[0];
         console.log('[DB] Email already captured for this URL');
       }
     } catch (checkError) {
@@ -162,13 +162,17 @@ async function saveCollectedEmail(email, url) {
     if (error) {
       const msg = error.message || '';
       if (msg.toLowerCase().includes('row-level security') || msg.toLowerCase().includes('permission')) {
-        console.warn('[DB] Row-level security prevented saving collected email; continuing without persistence');
-        return null;
+        throw new Error('Supabase row-level security or permission rules prevented saving the collected email. Configure SUPABASE_SERVICE_ROLE_KEY or allow inserts on emails_collected.');
       }
       throw error;
     }
 
-    return data;
+    if (!data || !Array.isArray(data) || data.length === 0) {
+      throw new Error('Collected email insert returned no data. Verify Supabase insert permissions and table schema.');
+    }
+
+    console.log('[DB] Saved collected email:', data[0]);
+    return data[0];
   } catch (error) {
     console.error('[DB] Failed to save collected email:', error.message);
     throw error;

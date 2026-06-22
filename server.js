@@ -15,7 +15,8 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 // Middleware
-app.use(cors());
+app.use(cors({ origin: ['http://localhost:3001', 'http://localhost:3000'], methods: ['GET', 'POST', 'OPTIONS'] }));
+app.options('/{*path}', cors());
 // Axe findings can include enough HTML snippets to exceed Express's 100 KB default.
 app.use(express.json({ limit: '5mb' }));
 
@@ -218,10 +219,10 @@ app.post('/collect-email', async (req, res) => {
   try {
     const { email, url, scanId } = req.body;
 
-    if (!email || !url) {
+    if (!email) {
       return res.status(400).json({
         error: 'Missing data',
-        message: 'Email and url are required.',
+        message: 'Email is required.',
       });
     }
 
@@ -232,24 +233,39 @@ app.post('/collect-email', async (req, res) => {
       });
     }
 
+    let urlToSave = url;
+    if (scanId && !Number.isNaN(Number(scanId))) {
+      const scan = await getScanById(Number(scanId));
+      if (scan && scan.url) {
+        urlToSave = scan.url;
+      }
+    }
+
+    if (!urlToSave) {
+      return res.status(400).json({
+        error: 'Missing data',
+        message: 'Email and url or scanId are required.',
+      });
+    }
+
     let parsedUrl;
     try {
-      parsedUrl = new URL(url);
+      parsedUrl = new URL(urlToSave);
     } catch {
       parsedUrl = null;
     }
 
-    if (!isReasonableString(url, 2048) || !parsedUrl || !['http:', 'https:'].includes(parsedUrl.protocol)) {
+    if (!isReasonableString(urlToSave, 2048) || !parsedUrl || !['http:', 'https:'].includes(parsedUrl.protocol)) {
       return res.status(400).json({
         error: 'Invalid request',
-        message: 'URL and scanResult must be valid.',
+        message: 'URL must be a valid http or https address.',
       });
     }
 
-    await saveCollectedEmail(email, url);
-    queueCollectedEmailReport(email, scanId);
+    await saveCollectedEmail(email.toLowerCase(), parsedUrl.toString());
+    queueCollectedEmailReport(email.toLowerCase(), scanId);
 
-    console.log(`[LEAD] Captured ${email} for scan ${scanId || '(no scan id)'} in ${Date.now() - submittedAt}ms`);
+    console.log(`[LEAD] Captured ${email.toLowerCase()} for scan ${scanId || '(no scan id)'} in ${Date.now() - submittedAt}ms`);
     return res.json({
       success: true,
       unlocked: true,
