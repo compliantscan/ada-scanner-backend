@@ -36,7 +36,7 @@ if (allowAllOrigins) {
   console.log('[CORS] Allowed origins:', allowedOrigins);
 }
 
-app.options('*', cors(corsOptions));
+app.options('(.*)', cors(corsOptions));
 app.use(cors(corsOptions));
 // Axe findings can include enough HTML snippets to exceed Express's 100 KB default.
 app.use(express.json({ limit: '5mb' }));
