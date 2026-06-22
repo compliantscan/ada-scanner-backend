@@ -13,10 +13,31 @@ const { calculateScore } = require('./scoring');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+const allowAllOrigins = !process.env.CORS_ALLOWED_ORIGINS;
+const allowedOrigins = allowAllOrigins
+  ? []
+  : process.env.CORS_ALLOWED_ORIGINS.split(',').map((origin) => origin.trim()).filter(Boolean);
 
-// Middleware
-app.use(cors({ origin: ['http://localhost:3001', 'http://localhost:3000'], methods: ['GET', 'POST', 'OPTIONS'] }));
-app.options('/{*path}', cors());
+const corsOptions = {
+  origin(origin, callback) {
+    if (!origin) return callback(null, true);
+    if (allowAllOrigins || allowedOrigins.includes(origin)) return callback(null, true);
+    callback(new Error(`CORS origin denied: ${origin}`));
+  },
+  methods: ['GET', 'POST', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  preflightContinue: false,
+  optionsSuccessStatus: 204,
+};
+
+if (allowAllOrigins) {
+  console.warn('[CORS] No CORS_ALLOWED_ORIGINS configured. Allowing all origins.');
+} else {
+  console.log('[CORS] Allowed origins:', allowedOrigins);
+}
+
+app.options('*', cors(corsOptions));
+app.use(cors(corsOptions));
 // Axe findings can include enough HTML snippets to exceed Express's 100 KB default.
 app.use(express.json({ limit: '5mb' }));
 
