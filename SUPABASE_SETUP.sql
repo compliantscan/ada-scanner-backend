@@ -24,14 +24,16 @@ CREATE INDEX IF NOT EXISTS scans_created_at_idx ON scans(created_at DESC);
 CREATE INDEX IF NOT EXISTS scans_url_idx ON scans(url);
 CREATE INDEX IF NOT EXISTS scans_access_key_hash_idx ON scans(access_key_hash);
 
--- Billing providers should provision one row after a successful subscription.
+-- Billing: one row per active subscription.
 -- Store only a SHA-256 hash of the report access token; never store the raw token.
 CREATE TABLE IF NOT EXISTS subscriptions (
   id BIGSERIAL PRIMARY KEY,
   user_email TEXT NOT NULL,
-  plan TEXT NOT NULL CHECK (plan IN ('starter', 'pro', 'business')),
-  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'past_due', 'canceled', 'expired')),
+  plan TEXT NOT NULL CHECK (plan IN ('starter', 'growth', 'agency', 'pro', 'business')),
+  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'inactive', 'past_due', 'canceled', 'expired')),
   access_token_hash TEXT NOT NULL UNIQUE,
+  stripe_customer_id TEXT UNIQUE,
+  stripe_subscription_id TEXT UNIQUE,
   customer_logo_url TEXT,
   current_period_end TIMESTAMP WITH TIME ZONE,
   created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
@@ -40,7 +42,13 @@ CREATE TABLE IF NOT EXISTS subscriptions (
 
 CREATE INDEX IF NOT EXISTS subscriptions_email_idx ON subscriptions(user_email);
 CREATE INDEX IF NOT EXISTS subscriptions_token_idx ON subscriptions(access_token_hash);
+CREATE INDEX IF NOT EXISTS subscriptions_stripe_customer_idx ON subscriptions(stripe_customer_id);
+CREATE INDEX IF NOT EXISTS subscriptions_stripe_sub_idx ON subscriptions(stripe_subscription_id);
 ALTER TABLE subscriptions ENABLE ROW LEVEL SECURITY;
+
+-- Safe to run against an existing installation (adds Stripe columns if missing).
+ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS stripe_customer_id TEXT UNIQUE;
+ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS stripe_subscription_id TEXT UNIQUE;
 
 -- AI fixes are cached by a fingerprint of rule + failing markup.
 CREATE TABLE IF NOT EXISTS ai_fix_cache (
@@ -52,7 +60,17 @@ CREATE TABLE IF NOT EXISTS ai_fix_cache (
 );
 ALTER TABLE ai_fix_cache ENABLE ROW LEVEL SECURITY;
 
--- Enable RLS (Row Level Security) - optional, for multi-user support
+-- Contact form submissions
+CREATE TABLE IF NOT EXISTS contact_submissions (
+  id BIGSERIAL PRIMARY KEY,
+  name TEXT NOT NULL,
+  email TEXT NOT NULL,
+  website TEXT,
+  message TEXT NOT NULL,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- Enable RLS on scans
 ALTER TABLE scans ENABLE ROW LEVEL SECURITY;
 
 -- Drop existing policies if they exist

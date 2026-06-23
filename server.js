@@ -4,7 +4,7 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const { scanUrl } = require('./scanner');
-const { saveScanResults, saveCollectedEmail, getScanById, getActiveSubscriptionByTokenHash, claimScanForSubscriber } = require('./db');
+const { saveScanResults, saveCollectedEmail, saveContactSubmission, getScanById, getActiveSubscriptionByTokenHash, claimScanForSubscriber, upsertSubscription, getSubscriptionByStripeCustomer } = require('./db');
 const { buildFreePaidBoundaryReport, buildPaidReport } = require('./paid-report-service');
 const { generatePaidReportPdf } = require('./report');
 const { sendPdfAttachmentEmail } = require('./email');
@@ -37,6 +37,82 @@ if (allowAllOrigins) {
 }
 
 app.use(cors(corsOptions));
+
+// Stripe webhook must receive raw body — register before express.json
+const stripe = process.env.STRIPE_SECRET_KEY ? require('stripe')(process.env.STRIPE_SECRET_KEY) : null;
+const STRIPE_PLANS = {
+  starter: process.env.STRIPE_PRICE_STARTER,
+  growth: process.env.STRIPE_PRICE_GROWTH,
+  agency: process.env.STRIPE_PRICE_AGENCY,
+};
+
+app.post('/webhook/stripe', express.raw({ type: 'application/json' }), async (req, res) => {
+  const sig = req.headers['stripe-signature'];
+  const secret = process.env.STRIPE_WEBHOOK_SECRET;
+  if (!stripe || !secret) return res.status(503).json({ message: 'Webhook not configured.' });
+  let event;
+  try {
+    event = stripe.webhooks.constructEvent(req.body, sig, secret);
+  } catch (err) {
+    console.error('[STRIPE] Webhook signature error:', err.message);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+  try {
+    if (event.type === 'checkout.session.completed') {
+      const session = event.data.object;
+      const subscription = await stripe.subscriptions.retrieve(session.subscription);
+      const customer = await stripe.customers.retrieve(session.customer);
+      const plan = session.metadata?.plan || 'starter';
+      const accessToken = generateAccessKey();
+      await upsertSubscription({
+        stripeCustomerId: session.customer,
+        stripeSubscriptionId: session.subscription,
+        userEmail: customer.email || session.customer_email || '',
+        plan,
+        status: 'active',
+        currentPeriodEnd: new Date(subscription.current_period_end * 1000).toISOString(),
+        accessTokenHash: hashSecret(accessToken),
+      });
+      console.log(`[STRIPE] Subscription activated: ${session.subscription} plan=${plan}`);
+    }
+    if (event.type === 'customer.subscription.updated') {
+      const sub = event.data.object;
+      const existing = await getSubscriptionByStripeCustomer(sub.customer);
+      if (existing) {
+        await upsertSubscription({
+          stripeCustomerId: sub.customer,
+          stripeSubscriptionId: sub.id,
+          userEmail: existing.user_email,
+          plan: existing.plan,
+          status: sub.status === 'active' ? 'active' : 'inactive',
+          currentPeriodEnd: new Date(sub.current_period_end * 1000).toISOString(),
+          accessTokenHash: existing.access_token_hash,
+        });
+      }
+    }
+    if (event.type === 'customer.subscription.deleted') {
+      const sub = event.data.object;
+      const existing = await getSubscriptionByStripeCustomer(sub.customer);
+      if (existing) {
+        await upsertSubscription({
+          stripeCustomerId: sub.customer,
+          stripeSubscriptionId: sub.id,
+          userEmail: existing.user_email,
+          plan: existing.plan,
+          status: 'inactive',
+          currentPeriodEnd: existing.current_period_end,
+          accessTokenHash: existing.access_token_hash,
+        });
+        console.log(`[STRIPE] Subscription cancelled: ${sub.id}`);
+      }
+    }
+  } catch (err) {
+    console.error('[STRIPE] Webhook handler error:', err.message);
+    return res.status(500).send('Handler error');
+  }
+  return res.json({ received: true });
+});
+
 // Axe findings can include enough HTML snippets to exceed Express's 100 KB default.
 app.use(express.json({ limit: '5mb' }));
 
@@ -256,41 +332,34 @@ app.post('/collect-email', async (req, res) => {
     let urlToSave = url;
     if (scanId && !Number.isNaN(Number(scanId))) {
       const scan = await getScanById(Number(scanId));
-      if (scan && scan.url) {
-        urlToSave = scan.url;
+      if (scan && scan.url) urlToSave = scan.url;
+    }
+
+    const isPricingInterest = typeof urlToSave === 'string' && urlToSave.startsWith('pricing-interest');
+
+    if (!isPricingInterest) {
+      if (!urlToSave) {
+        return res.status(400).json({ error: 'Missing data', message: 'Email and url or scanId are required.' });
       }
+      let parsedUrl;
+      try { parsedUrl = new URL(urlToSave); } catch { parsedUrl = null; }
+      if (!parsedUrl || !['http:', 'https:'].includes(parsedUrl.protocol)) {
+        return res.status(400).json({ error: 'Invalid request', message: 'URL must be a valid http or https address.' });
+      }
+      urlToSave = parsedUrl.toString();
     }
 
-    if (!urlToSave) {
-      return res.status(400).json({
-        error: 'Missing data',
-        message: 'Email and url or scanId are required.',
-      });
-    }
+    await saveCollectedEmail(email.toLowerCase(), urlToSave);
+    if (!isPricingInterest) queueCollectedEmailReport(email.toLowerCase(), scanId);
 
-    let parsedUrl;
-    try {
-      parsedUrl = new URL(urlToSave);
-    } catch {
-      parsedUrl = null;
-    }
-
-    if (!isReasonableString(urlToSave, 2048) || !parsedUrl || !['http:', 'https:'].includes(parsedUrl.protocol)) {
-      return res.status(400).json({
-        error: 'Invalid request',
-        message: 'URL must be a valid http or https address.',
-      });
-    }
-
-    await saveCollectedEmail(email.toLowerCase(), parsedUrl.toString());
-    queueCollectedEmailReport(email.toLowerCase(), scanId);
-
-    console.log(`[LEAD] Captured ${email.toLowerCase()} for scan ${scanId || '(no scan id)'} in ${Date.now() - submittedAt}ms`);
+    console.log(`[LEAD] Captured ${email.toLowerCase()} for ${urlToSave} in ${Date.now() - submittedAt}ms`);
     return res.json({
       success: true,
-      unlocked: true,
-      capabilities: unlockedCapabilities({ subscribed: false }),
-      message: 'Email saved. The full report is unlocked and the PDF is being emailed.',
+      unlocked: !isPricingInterest,
+      capabilities: isPricingInterest ? null : unlockedCapabilities({ subscribed: false }),
+      message: isPricingInterest
+        ? "Thanks! We'll email you when this plan is ready."
+        : 'Email saved. The full report is unlocked and the PDF is being emailed.',
     });
   } catch (error) {
     console.error('Email collection error:', error);
@@ -335,6 +404,20 @@ app.post('/lead-report/pdf', async (req, res) => {
   } catch (error) {
     console.error('Lead report PDF error:', error);
     return res.status(error.statusCode || 500).json({ error: 'Unable to generate report PDF', message: error.message });
+  }
+});
+
+app.post('/contact', async (req, res) => {
+  try {
+    const { name, email, website, message } = req.body;
+    if (!isReasonableString(name, 200)) return res.status(400).json({ message: 'Name is required.' });
+    if (!isValidEmail(email) || email.length > 254) return res.status(400).json({ message: 'A valid email is required.' });
+    if (!isReasonableString(message, 5000)) return res.status(400).json({ message: 'Message is required.' });
+    await saveContactSubmission(name.trim(), email.toLowerCase(), website?.trim() || null, message.trim());
+    return res.json({ success: true, message: 'Message received. We will reply within one business day.' });
+  } catch (error) {
+    console.error('Contact submission error:', error);
+    return res.status(500).json({ message: 'Failed to send message. Please try again.' });
   }
 });
 
@@ -397,6 +480,45 @@ app.post('/paid-report/pdf', async (req, res) => {
   } catch (error) {
     console.error('Paid report PDF error:', error);
     return res.status(error.statusCode || 500).json({ error: 'Unable to generate paid report PDF', message: error.message });
+  }
+});
+
+app.post('/checkout', async (req, res) => {
+  if (!stripe) return res.status(503).json({ message: 'Payments not configured.' });
+  const { plan, email } = req.body;
+  const priceId = STRIPE_PLANS[plan];
+  if (!priceId) return res.status(400).json({ message: 'Invalid plan.' });
+  const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
+  try {
+    const session = await stripe.checkout.sessions.create({
+      mode: 'subscription',
+      customer_email: email || undefined,
+      line_items: [{ price: priceId, quantity: 1 }],
+      success_url: `${frontendUrl}/checkout/success?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${frontendUrl}/pricing`,
+      metadata: { plan },
+    });
+    return res.json({ url: session.url });
+  } catch (err) {
+    console.error('[STRIPE] Checkout error:', err.message);
+    return res.status(500).json({ message: err.message });
+  }
+});
+
+app.post('/billing-portal', async (req, res) => {
+  if (!stripe) return res.status(503).json({ message: 'Payments not configured.' });
+  const { customerId } = req.body;
+  if (!customerId) return res.status(400).json({ message: 'customerId required.' });
+  const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
+  try {
+    const session = await stripe.billingPortal.sessions.create({
+      customer: customerId,
+      return_url: `${frontendUrl}/billing`,
+    });
+    return res.json({ url: session.url });
+  } catch (err) {
+    console.error('[STRIPE] Billing portal error:', err.message);
+    return res.status(500).json({ message: err.message });
   }
 });
 

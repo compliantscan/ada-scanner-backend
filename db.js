@@ -288,9 +288,52 @@ async function saveCachedAiFix(fingerprint, criterion, result) {
   return result;
 }
 
+async function upsertSubscription({ stripeCustomerId, stripeSubscriptionId, userEmail, plan, status, currentPeriodEnd, accessTokenHash, customerLogoUrl = null }) {
+  if (!supabaseAdmin) throw new Error('upsertSubscription requires SUPABASE_SERVICE_ROLE_KEY.');
+  const { data, error } = await supabaseAdmin.from('subscriptions').upsert({
+    stripe_customer_id: stripeCustomerId,
+    stripe_subscription_id: stripeSubscriptionId,
+    user_email: userEmail,
+    plan,
+    status,
+    current_period_end: currentPeriodEnd,
+    access_token_hash: accessTokenHash,
+    customer_logo_url: customerLogoUrl,
+    updated_at: new Date().toISOString(),
+  }, { onConflict: 'stripe_subscription_id' }).select();
+  if (error) throw error;
+  return data?.[0];
+}
+
+async function getSubscriptionByStripeCustomer(stripeCustomerId) {
+  const client = supabaseAdmin || supabase;
+  const { data, error } = await client
+    .from('subscriptions')
+    .select('*')
+    .eq('stripe_customer_id', stripeCustomerId)
+    .order('updated_at', { ascending: false })
+    .limit(1);
+  if (error) throw error;
+  return data?.[0] || null;
+}
+
+async function saveContactSubmission(name, email, website, message) {
+  const client = supabaseAdmin || supabase;
+  const { data, error } = await client.from('contact_submissions').insert([{
+    name,
+    email,
+    website: website || null,
+    message,
+    created_at: new Date().toISOString(),
+  }]).select();
+  if (error) throw error;
+  return data?.[0];
+}
+
 module.exports = {
   saveScanResults,
   saveCollectedEmail,
+  saveContactSubmission,
   getUserScans,
   getScanById,
   getScanHistory,
@@ -298,5 +341,7 @@ module.exports = {
   claimScanForSubscriber,
   getCachedAiFix,
   saveCachedAiFix,
+  upsertSubscription,
+  getSubscriptionByStripeCustomer,
   supabase,
 };
