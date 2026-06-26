@@ -1,0 +1,6 @@
+1. Inspect backend startup scripts and test scripts
+2. Confirm whether local environment can run Playwright scans
+3. Run a scan batch and collect memory/process data locally
+4. Identify root cause from logs/process behavior
+5. Disable ai_fix_cache entirely if not required
+6. Report findings and required permanent fixes

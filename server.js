@@ -244,8 +244,11 @@ app.post('/scan', async (req, res) => {
     // Run the scan
     let results;
     try {
+      console.log('[API] Launching scanUrl');
       results = await scanUrl(normalizedUrl);
+      console.log('[API] scanUrl completed successfully');
     } catch (scanError) {
+      console.error('[API] scanUrl error:', scanError && (scanError.stack || scanError));
       if (scanError.name === 'ScanError') {
         return res.status(scanError.httpStatus || 400).json({
           error: scanError.name,
@@ -302,10 +305,10 @@ app.post('/scan', async (req, res) => {
       savedToDatabase: !!savedRecord,
     });
   } catch (error) {
-    console.error('Scan error:', error);
+    console.error('Scan error:', error && (error.stack || error));
     return res.status(500).json({
       error: 'Scan failed',
-      message: error.message,
+      message: error.message || 'Unexpected server error',
     });
   }
 });

@@ -20,6 +20,11 @@ if (serviceRoleKey) {
   supabaseAdmin = createClient(supabaseUrl, serviceRoleKey);
 }
 
+// Track whether the ai_fix_cache table appears available. If a lookup fails
+// with a missing-relation or permission error, we'll disable future cache
+// attempts to avoid noisy logs and repeated failures.
+let aiFixCacheAvailable = true;
+
 /**
  * Save scan results to Supabase "scans" table
  * @param {string} url - The URL that was scanned
@@ -264,28 +269,63 @@ async function claimScanForSubscriber(scanId, userEmail) {
 
 async function getCachedAiFix(fingerprint) {
   if (!supabaseAdmin) return null;
-  const { data, error } = await supabaseAdmin
-    .from('ai_fix_cache')
-    .select('result_json')
-    .eq('fingerprint', fingerprint)
-    .limit(1);
-  if (error) {
-    console.warn('[DB] AI cache lookup failed:', error.message);
+  if (!aiFixCacheAvailable) return null;
+  try {
+    const { data, error } = await supabaseAdmin
+      .from('ai_fix_cache')
+      .select('result_json')
+      .eq('fingerprint', fingerprint)
+      .limit(1);
+    if (error) {
+      const msg = (error && error.message) || '';
+      console.warn('[DB] AI cache lookup failed:', msg);
+      // If the table doesn't exist or permissions block access, disable further attempts
+      if (/ai_fix_cache/i.test(msg) && (/does not exist|relation|could not find|permission|row-level security/i.test(msg) || /PGRST204/.test(error.code || ''))) {
+        aiFixCacheAvailable = false;
+        console.warn('[DB] Disabling AI cache lookups for future requests (table missing or inaccessible).');
+      }
+      return null;
+    }
+    return data?.[0]?.result_json || null;
+  } catch (err) {
+    const msg = (err && err.message) || err;
+    console.warn('[DB] AI cache lookup unexpected failure:', msg);
+    if (/ai_fix_cache/i.test(msg) && (/does not exist|relation|could not find|permission|row-level security/i.test(msg))) {
+      aiFixCacheAvailable = false;
+      console.warn('[DB] Disabling AI cache lookups for future requests (table missing or inaccessible).');
+    }
     return null;
   }
-  return data?.[0]?.result_json || null;
 }
 
 async function saveCachedAiFix(fingerprint, criterion, result) {
   if (!supabaseAdmin) return null;
-  const { error } = await supabaseAdmin.from('ai_fix_cache').upsert({
-    fingerprint,
-    criterion,
-    result_json: result,
-    updated_at: new Date().toISOString(),
-  });
-  if (error) console.warn('[DB] AI cache write failed:', error.message);
-  return result;
+  if (!aiFixCacheAvailable) return null;
+  try {
+    const { error } = await supabaseAdmin.from('ai_fix_cache').upsert({
+      fingerprint,
+      criterion,
+      result_json: result,
+      updated_at: new Date().toISOString(),
+    });
+    if (error) {
+      const msg = (error && error.message) || '';
+      console.warn('[DB] AI cache write failed:', msg);
+      if (/ai_fix_cache/i.test(msg) && (/does not exist|relation|could not find|permission|row-level security/i.test(msg) || /PGRST204/.test(error.code || ''))) {
+        aiFixCacheAvailable = false;
+        console.warn('[DB] Disabling AI cache writes for future requests (table missing or inaccessible).');
+      }
+    }
+    return result;
+  } catch (err) {
+    const msg = (err && err.message) || err;
+    console.warn('[DB] AI cache upsert unexpected failure:', msg);
+    if (/ai_fix_cache/i.test(msg) && (/does not exist|relation|could not find|permission|row-level security/i.test(msg))) {
+      aiFixCacheAvailable = false;
+      console.warn('[DB] Disabling AI cache writes for future requests (table missing or inaccessible).');
+    }
+    return result;
+  }
 }
 
 async function upsertSubscription({ stripeCustomerId, stripeSubscriptionId, userEmail, plan, status, currentPeriodEnd, accessTokenHash, customerLogoUrl = null }) {

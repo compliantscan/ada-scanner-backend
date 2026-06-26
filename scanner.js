@@ -23,31 +23,57 @@ function classifyPlaywrightError(error) {
   if (msg.includes('ERR_NETWORK_CHANGED') || msg.includes('ERR_INTERNET_DISCONNECTED')) {
     return new ScanError('network connection interrupted - please retry', 503);
   }
-  if (msg.includes('Navigation timeout') || msg.includes('Timeout') || msg.includes('timeout')) {
+  if (msg.includes('Navigation timeout') || msg.includes('Timeout') || msg.includes('timeout') || msg.includes('closed')) {
     return new ScanError('timed out while loading the site', 504);
+  }
+  if (msg.includes('Page crashed') || msg.includes('Renderer process crashed') || msg.includes('closed')) {
+    return new ScanError('browser crashed during scan', 500);
   }
   return new ScanError('unable to load the site', 400);
 }
 
 async function scanUrl(url) {
-  let browser;
+  let browser = null;
+  let context = null;
+  let page = null;
   try {
     console.log(`Starting scan of: ${url}`);
-    
+
+    const mem = process.memoryUsage();
+    console.log('[SCAN] Memory usage before launch:', { rss: mem.rss, heapTotal: mem.heapTotal, heapUsed: mem.heapUsed });
+    if (mem.rss && mem.rss < 700 * 1024 * 1024) {
+      console.warn('[SCAN] Warning: available RSS memory is low for Chromium — Railway may need more memory.');
+    }
+
+    console.log('[SCAN] Launching Chromium...');
     browser = await chromium.launch({ 
       args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
       headless: true
     });
-    
-    const context = await browser.newContext({ 
+    console.log('[SCAN] Chromium launched');
+
+    context = await browser.newContext({ 
       userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36',
       bypassCSP: true,
       ignoreHTTPSErrors: true
     });
-    
-    const page = await context.newPage();
+    console.log('[SCAN] Browser context created');
+
+    page = await context.newPage();
     page.setDefaultNavigationTimeout(90000);
-    
+    console.log('[SCAN] Page created');
+
+    // Attach crash listeners to detect page termination
+    let pageCrashed = false;
+    page.on('close', () => {
+      console.warn('[SCAN] Page closed unexpectedly during scan');
+      pageCrashed = true;
+    });
+    page.on('error', (err) => {
+      console.warn('[SCAN] Page error event:', err && err.message);
+      pageCrashed = true;
+    });
+
     console.log('Loading page...');
     let navSuccess = false;
     const strategies = [
@@ -70,11 +96,38 @@ async function scanUrl(url) {
     if (!navSuccess) {
       throw new ScanError('unable to load the site after multiple attempts', 504);
     }
-    
-    await page.waitForTimeout(2000);
-    
+
+    try {
+      await page.waitForTimeout(2000);
+    } catch (tErr) {
+      // page.waitForTimeout can throw if page crashes — surface it below
+      console.warn('[SCAN] waitForTimeout failed:', tErr && tErr.message);
+      throw tErr;
+    }
+
+    if (pageCrashed) {
+      throw new ScanError('page crashed during page load', 500);
+    }
+
     console.log('Running accessibility scan...');
-    const results = await new AxeBuilder({ page }).analyze();
+    // Wrap Axe analysis in a timeout to prevent hanging on complex sites
+    const axeTimeoutMs = 120000;
+    const axeAnalysisPromise = new AxeBuilder({ page }).analyze();
+    const axeTimeoutPromise = new Promise((_, reject) =>
+      setTimeout(() => reject(new Error('Axe analysis timeout after ' + axeTimeoutMs + 'ms')), axeTimeoutMs)
+    );
+    
+    let results;
+    try {
+      results = await Promise.race([axeAnalysisPromise, axeTimeoutPromise]);
+    } catch (axeErr) {
+      const errMsg = axeErr && (axeErr.message || String(axeErr));
+      if (errMsg.includes('timeout')) {
+        console.warn('[SCAN] Axe analysis timed out or page crashed:', errMsg);
+        throw new ScanError('accessibility scan timed out', 504);
+      }
+      throw axeErr;
+    }
     
     console.log('\n========== SCAN RESULTS ==========\n');
     console.log(`URL: ${url}`);
@@ -99,18 +152,48 @@ async function scanUrl(url) {
     
     console.log('\n================================\n');
     
-    await context.close();
+    console.log('[SCAN] Scan completed for:', url);
     return results;
   } catch (error) {
-    console.error('Error during scan:', error.message);
+    // Log full stack for crashes and unexpected errors
+    console.error('[SCAN] Error during scan:', error && (error.stack || error));
+    // If this looks like a Chromium/page crash, ensure full stacktrace is logged
+    const msg = (error && error.message) || '';
+    if (msg.includes('Page crashed') || msg.includes('Renderer process crashed') || msg.includes('Page crashed')) {
+      console.error('[SCAN] Chromium crash detected — full error object:', error);
+    }
     if (error.name === 'ScanError') {
       throw error;
     }
     throw classifyPlaywrightError(error);
   } finally {
-    if (browser) {
-      await browser.close();
+    // Close page, context, browser in a safe order without allowing close failures to mask the original error
+    if (page) {
+      try {
+        await page.close();
+        console.log('[SCAN] Page closed');
+      } catch (closePageErr) {
+        console.warn('[SCAN] Failed to close page:', closePageErr && closePageErr.message);
+      }
     }
+    if (context) {
+      try {
+        await context.close();
+        console.log('[SCAN] Context closed');
+      } catch (closeContextErr) {
+        console.warn('[SCAN] Failed to close context:', closeContextErr && closeContextErr.message);
+      }
+    }
+    if (browser) {
+      try {
+        await browser.close();
+        console.log('[SCAN] Browser closed');
+      } catch (closeBrowserErr) {
+        console.error('[SCAN] Failed to close browser:', closeBrowserErr && closeBrowserErr.stack ? closeBrowserErr.stack : closeBrowserErr);
+      }
+    }
+    const memAfter = process.memoryUsage();
+    console.log('[SCAN] Memory usage after scan:', { rss: memAfter.rss, heapTotal: memAfter.heapTotal, heapUsed: memAfter.heapUsed });
   }
 }
 
