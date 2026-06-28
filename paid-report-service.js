@@ -163,6 +163,7 @@ async function buildReport(scanRecord, options = {}) {
       url: scanRecord.url,
       violations: violations.length,
       density: violations.length,
+      affectedElements: violations.reduce((sum, v) => sum + (v.affectedElements || 0), 0),
       scannedAt: scanRecord.created_at,
     }],
     trend: {
