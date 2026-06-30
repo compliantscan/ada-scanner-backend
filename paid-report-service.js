@@ -68,11 +68,17 @@ function sortByRemediationPriority(a, b) {
 }
 
 function severityCounts(violations) {
-  return violations.reduce((counts, item) => {
+  const counts = violations.reduce((acc, item) => {
     const severity = item.severity || item.impact || 'minor';
-    if (Object.hasOwn(counts, severity)) counts[severity] += 1;
-    return counts;
+    if (Object.hasOwn(acc, severity)) acc[severity] += 1;
+    return acc;
   }, { critical: 0, serious: 0, moderate: 0, minor: 0 });
+
+  counts.totalAffectedElements = violations.reduce((sum, item) => {
+    return sum + (Number.isFinite(item.affectedElements) ? item.affectedElements : 0);
+  }, 0);
+
+  return counts;
 }
 
 async function buildReport(scanRecord, options = {}) {
