@@ -71,19 +71,43 @@ async function saveScanResults(url, results, userEmail = null, metadata = {}) {
     console.log('[DB] Supabase insert attempt result:', { status: attempt.status, data: attempt.data, error: attempt.error });
 
     if (attempt.error) {
-      // If schema cache / missing column error, try a more minimal insert as a fallback
       const msg = attempt.error.message || '';
       if (attempt.error.code === 'PGRST204' || /Could not find the/.test(msg)) {
-        console.warn('[DB] Schema mismatch detected; attempting minimal insert');
+        console.warn('[DB] Schema mismatch detected; attempting fallback insert');
 
-        const minimalPayload = {
+        const missingColumns = [];
+        const missingColumnRegex = /Could not find the '([^']+)' column of 'scans'/g;
+        let match;
+        while ((match = missingColumnRegex.exec(msg)) !== null) {
+          missingColumns.push(match[1]);
+        }
+
+        const basePayload = {
           url,
           user_email: userEmail,
           total_violations: results.violations.length,
+          affected_elements: totalAffectedElements,
+          violations_by_severity: violationsBySeverity,
           results_json: results,
+          score: metadata.score ?? null,
+          access_key_hash: metadata.accessKeyHash || null,
+          free_report_expires_at: metadata.freeReportExpiresAt || null,
+          created_at: new Date().toISOString(),
         };
 
-        const fallback = await client.from('scans').insert([minimalPayload]).select();
+        const makeFallbackPayload = cols => {
+          const payload = { url, user_email: userEmail, total_violations: results.violations.length, results_json: results };
+          if (!cols.includes('affected_elements')) payload.affected_elements = totalAffectedElements;
+          if (!cols.includes('violations_by_severity')) payload.violations_by_severity = violationsBySeverity;
+          if (!cols.includes('score')) payload.score = metadata.score ?? null;
+          if (!cols.includes('access_key_hash')) payload.access_key_hash = metadata.accessKeyHash || null;
+          if (!cols.includes('free_report_expires_at')) payload.free_report_expires_at = metadata.freeReportExpiresAt || null;
+          if (!cols.includes('created_at')) payload.created_at = new Date().toISOString();
+          return payload;
+        };
+
+        let fallbackPayload = makeFallbackPayload(missingColumns);
+        let fallback = await client.from('scans').insert([fallbackPayload]).select();
         console.log('[DB] Supabase fallback insert result:', {
           status: fallback.status,
           data: fallback.data,
@@ -92,13 +116,24 @@ async function saveScanResults(url, results, userEmail = null, metadata = {}) {
 
         if (fallback.error) {
           const fallbackMsg = fallback.error.message || '';
+          const secondMissing = [];
+          while ((match = missingColumnRegex.exec(fallbackMsg)) !== null) {
+            secondMissing.push(match[1]);
+          }
+
           if (fallback.error.code === 'PGRST204' || /Could not find the/.test(fallbackMsg)) {
-            console.warn('[DB] Minimal fallback still failed due to schema mismatch; retrying insert without select()');
-            const silentFallback = await client.from('scans').insert([minimalPayload]);
-            if (silentFallback.error) {
-              throw silentFallback.error;
+            console.warn('[DB] Second fallback due to schema mismatch; removing additional unknown columns');
+            fallbackPayload = makeFallbackPayload([...new Set([...missingColumns, ...secondMissing])]);
+            const secondAttempt = await client.from('scans').insert([fallbackPayload]).select();
+            console.log('[DB] Supabase second fallback result:', {
+              status: secondAttempt.status,
+              data: secondAttempt.data,
+              error: secondAttempt.error,
+            });
+            if (secondAttempt.error) {
+              throw secondAttempt.error;
             }
-            return [];
+            return secondAttempt.data || [];
           }
           throw fallback.error;
         }
