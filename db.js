@@ -71,27 +71,38 @@ async function saveScanResults(url, results, userEmail = null, metadata = {}) {
     console.log('[DB] Supabase insert attempt result:', { status: attempt.status, data: attempt.data, error: attempt.error });
 
     if (attempt.error) {
-      // If schema cache / missing column error, try a minimal insert as a fallback
+      // If schema cache / missing column error, try a more minimal insert as a fallback
       const msg = attempt.error.message || '';
       if (attempt.error.code === 'PGRST204' || /Could not find the/.test(msg)) {
         console.warn('[DB] Schema mismatch detected; attempting minimal insert');
-        const fallback = await client.from('scans').insert([
-          {
-            url,
-            user_email: userEmail,
-            total_violations: results.violations.length,
-            affected_elements: totalAffectedElements,
-            results_json: results,
-          },
-        ]).select();
+
+        const minimalPayload = {
+          url,
+          user_email: userEmail,
+          total_violations: results.violations.length,
+          results_json: results,
+        };
+
+        const fallback = await client.from('scans').insert([minimalPayload]).select();
         console.log('[DB] Supabase fallback insert result:', {
           status: fallback.status,
           data: fallback.data,
           error: fallback.error,
         });
+
         if (fallback.error) {
+          const fallbackMsg = fallback.error.message || '';
+          if (fallback.error.code === 'PGRST204' || /Could not find the/.test(fallbackMsg)) {
+            console.warn('[DB] Minimal fallback still failed due to schema mismatch; retrying insert without select()');
+            const silentFallback = await client.from('scans').insert([minimalPayload]);
+            if (silentFallback.error) {
+              throw silentFallback.error;
+            }
+            return [];
+          }
           throw fallback.error;
         }
+
         return fallback.data;
       }
 
@@ -101,7 +112,7 @@ async function saveScanResults(url, results, userEmail = null, metadata = {}) {
     // If insert returned no body (data null or empty), try to fetch the recently inserted row
     if (!attempt.data || (Array.isArray(attempt.data) && attempt.data.length === 0)) {
       console.warn('[DB] Insert returned no row; attempting to fetch recent row for URL');
-      const { data: recent, error: recentError } = await supabase
+      const { data: recent, error: recentError } = await client
         .from('scans')
         .select('*')
         .eq('url', url)
