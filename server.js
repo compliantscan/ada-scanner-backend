@@ -125,8 +125,29 @@ function isReasonableString(value, maxLength = 2048) {
 }
 
 function normalizedScanUrl(value) {
-  const parsed = new URL(value);
+  if (typeof value !== 'string') throw new Error('URL must be a string');
+  const trimmed = value.trim();
+  if (!trimmed) throw new Error('URL is required');
+
+  let normalized = trimmed;
+  if (!/^[a-zA-Z][a-zA-Z\d+\-.]*:\/\//.test(normalized)) {
+    normalized = `https://${normalized}`;
+  }
+
+  if ((normalized.match(/https?:\/\//gi) || []).length > 1) {
+    throw new Error('Invalid URL: multiple protocols detected.');
+  }
+
+  const parsed = new URL(normalized);
   if (!['http:', 'https:'].includes(parsed.protocol)) throw new Error('URL must use http or https');
+  const hostname = parsed.hostname.toLowerCase();
+  if (hostname === 'http' || hostname === 'https') {
+    throw new Error('Invalid URL hostname.');
+  }
+  if (parsed.pathname.startsWith('//')) {
+    throw new Error('Invalid URL format.');
+  }
+
   parsed.hash = '';
   return parsed.toString();
 }

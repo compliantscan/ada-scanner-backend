@@ -17,6 +17,7 @@ CREATE TABLE IF NOT EXISTS scans (
 ALTER TABLE scans ADD COLUMN IF NOT EXISTS score INTEGER;
 ALTER TABLE scans ADD COLUMN IF NOT EXISTS access_key_hash TEXT;
 ALTER TABLE scans ADD COLUMN IF NOT EXISTS free_report_expires_at TIMESTAMP WITH TIME ZONE;
+ALTER TABLE scans ADD COLUMN IF NOT EXISTS affected_elements INTEGER;
 
 -- Add indexes for faster queries
 CREATE INDEX IF NOT EXISTS scans_user_email_idx ON scans(user_email);

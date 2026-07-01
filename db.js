@@ -43,6 +43,10 @@ async function saveScanResults(url, results, userEmail = null, metadata = {}) {
       moderate: results.violations.filter(v => v.impact === 'moderate').length,
       minor: results.violations.filter(v => v.impact === 'minor').length,
     };
+    const totalAffectedElements = results.violations.reduce(
+      (sum, violation) => sum + (Array.isArray(violation.nodes) ? violation.nodes.length : 0),
+      0
+    );
 
     // Choose client: prefer admin (service_role) client for server-side writes
     const client = supabaseAdmin || supabase;
@@ -54,6 +58,7 @@ async function saveScanResults(url, results, userEmail = null, metadata = {}) {
         url,
         user_email: userEmail,
         total_violations: results.violations.length,
+        affected_elements: totalAffectedElements,
         violations_by_severity: violationsBySeverity,
         results_json: results,
         score: metadata.score ?? null,
@@ -70,10 +75,12 @@ async function saveScanResults(url, results, userEmail = null, metadata = {}) {
       const msg = attempt.error.message || '';
       if (attempt.error.code === 'PGRST204' || /Could not find the/.test(msg)) {
         console.warn('[DB] Schema mismatch detected; attempting minimal insert');
-        const fallback = await supabase.from('scans').insert([
+        const fallback = await client.from('scans').insert([
           {
             url,
             user_email: userEmail,
+            total_violations: results.violations.length,
+            affected_elements: totalAffectedElements,
             results_json: results,
           },
         ]).select();
