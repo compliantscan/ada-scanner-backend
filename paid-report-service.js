@@ -94,6 +94,7 @@ async function buildReport(scanRecord, options = {}) {
     const fix = await generateFix({ ...violation, _criterion: criterion, _criterionName: criterionName }, criterion, criterionName);
     return {
       ruleId: violation.id,
+      fixType: violation.id === 'color-contrast' ? 'color-contrast' : 'code',
       severity: violation.impact,
       title: violation.description || violation.help || violation.id,
       description: violation.help || violation.description,

@@ -13,6 +13,40 @@ function severityColor(severity) {
   return { critical: '#dc2626', serious: '#d97706', moderate: '#ca8a04', minor: '#64748b' }[severity] || '#64748b';
 }
 
+function renderFixBlock(item) {
+  // Priority 1: color-contrast with real data
+  if (item.fixType === 'color-contrast' && item.fix?.colorContrast) {
+    const contrast = item.fix.colorContrast || {};
+    return `
+      <div class="contrast-fix-grid">
+        <div><strong>Current text color</strong><span>${escapeHtml(contrast.currentTextColor || '—')}</span></div>
+        <div><strong>Current background color</strong><span>${escapeHtml(contrast.currentBackgroundColor || 'Not detectable')}</span></div>
+        <div><strong>Suggested text color</strong><span>${escapeHtml(contrast.suggestedTextColor || '—')}</span></div>
+        <div><strong>Resulting contrast ratio</strong><span>${escapeHtml(contrast.resultingContrastRatio || '—')}</span></div>
+      </div>
+    `;
+  }
+
+  // Priority 2: color-contrast manual review required
+  if (item.fixType === 'color-contrast' && item.fix?.manualReviewRequired) {
+    return `
+      <p class="muted" style="padding: 14px; border-radius: 8px; background: #f3f4f6; border-left: 3px solid #9ca3af;">
+        Manual review required — automatic color detection was not available for this violation.
+      </p>
+    `;
+  }
+
+  // Priority 3: other violation types (code fix)
+  return `
+    <div class="replace-grid">
+      <div><strong>Replace this</strong>${(item.fix.replaceThis || item.elementHtml)
+        ? `<pre>${escapeHtml(item.fix.replaceThis || item.elementHtml)}</pre>`
+        : '<p class="muted">No element snippet available for this violation</p>'}</div>
+      <div><strong>With this</strong><pre>${escapeHtml(item.fix.withThis)}</pre></div>
+    </div>
+  `;
+}
+
 function renderPaidReportHtml(report) {
   const brandName = escapeHtml(report.branding?.name || 'ADA Scanner');
   const logo = report.branding?.logoUrl
@@ -30,17 +64,14 @@ function renderPaidReportHtml(report) {
       <p>${escapeHtml(item.description)}</p>
       <div class="meta-grid">
         <div><strong>Affected elements</strong><span>${item.affectedElements}</span></div>
-        <div><strong>Source</strong><span>${item.sourceDetected ? `${escapeHtml(item.filePath || 'Unknown file')}:${escapeHtml(item.lineNumber || '?')}` : 'Runtime DOM — source line not detectable'}</span></div>
+        <div><strong>Source</strong><span>${item.sourceDetected ? `${escapeHtml(item.filePath || 'Unknown file')}:${escapeHtml(item.lineNumber || '?')}` : item.target ? `Runtime DOM target: ${escapeHtml(item.target)}` : 'Runtime DOM - source line not detectable'}</span></div>
         <div><strong>Effort</strong><span>${escapeHtml(item.fix.effort)}</span></div>
       </div>
       <p class="code-label">Element HTML snippet</p>
       <pre>${escapeHtml(item.elementHtml || 'No HTML snippet captured.')}</pre>
       <div class="fix-box">
         <h4>${item.fix.aiGenerated ? 'AI-generated fix' : 'Suggested fix'}</h4>
-        <div class="replace-grid">
-          <div><strong>Replace this</strong><pre>${escapeHtml(item.fix.replaceThis || item.elementHtml || 'Current implementation')}</pre></div>
-          <div><strong>With this</strong><pre>${escapeHtml(item.fix.withThis)}</pre></div>
-        </div>
+        ${renderFixBlock(item)}
         <p>${escapeHtml(item.fix.explanation)}</p>
       </div>
     </article>
@@ -50,7 +81,7 @@ function renderPaidReportHtml(report) {
     <li><strong>#${item.rank} ${escapeHtml(item.title)}</strong><span>${item.riskReductionPerHour} risk-reduction pts/hr · ${item.estimatedMinutes} min</span></li>
   `).join('');
   const pages = report.pages.map(page => `<tr><td>${escapeHtml(page.url)}</td><td>${page.violations}</td><td>${page.density}/page</td><td>${page.affectedElements || 0}</td></tr>`).join('');
-  const badge = report.complianceBadgeHtml ? `<pre>${escapeHtml(report.complianceBadgeHtml)}</pre>` : '<p class="muted">Available on Pro and Business plans.</p>';
+  const badge = report.complianceBadgeHtml ? `<pre>${escapeHtml(report.complianceBadgeHtml)}</pre>` : '<p class="muted">Available with CompliantScan Monitoring — $199/mo.</p>';
 
   return `<!doctype html>
   <html>
@@ -84,12 +115,12 @@ function renderPaidReportHtml(report) {
         pre { white-space: pre-wrap; word-break: break-word; margin: 8px 0 0; padding: 12px; border-radius: 12px; background: #0f172a; color: #e2e8f0; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 11px; }
         .code-label { margin: 18px 0 0; color:#64748b; font-weight:800; font-size: 11px; text-transform: uppercase; }
         .fix-box { margin-top: 16px; padding: 16px; border-radius: 14px; background: #f0fdf4; border: 1px solid #bbf7d0; } .fix-box h4 { margin:0 0 10px; color:#15803d; } .fix-box pre { background: #ecfdf5; color: #14532d; border: 1px solid #bbf7d0; }
-        .replace-grid { display:grid; grid-template-columns: 1fr 1fr; gap: 12px; } table { width: 100%; border-collapse: collapse; background: white; border-radius: 16px; overflow: hidden; } th, td { padding: 13px; border-bottom: 1px solid #e2e8f0; text-align: left; font-size: 13px; } th { background: #eff6ff; color: #1d4ed8; }
+        .replace-grid { display:grid; grid-template-columns: 1fr 1fr; gap: 12px; } .contrast-fix-grid { display:grid; grid-template-columns: repeat(2, 1fr); gap: 10px; } .contrast-fix-grid div { padding: 12px; border-radius: 12px; background: #ecfdf5; border: 1px solid #bbf7d0; } .contrast-fix-grid strong { display:block; font-size: 11px; color:#64748b; text-transform:uppercase; } .contrast-fix-grid span { display:block; margin-top:6px; font-size:13px; color:#14532d; } table { width: 100%; border-collapse: collapse; background: white; border-radius: 16px; overflow: hidden; } th, td { padding: 13px; border-bottom: 1px solid #e2e8f0; text-align: left; font-size: 13px; } th { background: #eff6ff; color: #1d4ed8; }
       </style>
     </head>
     <body>
-      <section class="page cover"><div class="brand">${logo}</div><p class="label">Paid ADA compliance report</p><h1>Consultant-grade accessibility audit</h1><p class="cover-url">${escapeHtml(report.url)}</p><div class="stat-grid"><div class="stat"><span>Score</span><strong>${report.executiveSummary.score} / ${report.executiveSummary.grade}</strong></div><div class="stat"><span>Risk</span><strong>${escapeHtml(report.executiveSummary.riskLevel)}</strong></div><div class="stat"><span>Report ID</span><strong style="font-size:17px">${escapeHtml(report.reportId)}</strong></div></div></section>
-      <section class="page"><h2>Executive summary</h2><div class="risk-alert-bar"><div class="risk-alert-item"><span class="risk-alert-label">Settlement range</span><strong class="risk-alert-value">${escapeHtml(report.executiveSummary.settlementRange)}</strong></div><div class="risk-alert-divider"></div><div class="risk-alert-item"><span class="risk-alert-label">Estimated fix time</span><strong class="risk-alert-value">${escapeHtml(report.executiveSummary.estimatedFixTime)}</strong></div><div class="risk-alert-divider"></div><div class="risk-alert-item"><span class="risk-alert-label">Risk level</span><strong class="risk-alert-value">${escapeHtml(report.executiveSummary.riskLevel)}</strong></div><div class="risk-alert-divider"></div><div class="risk-alert-item"><span class="risk-alert-label">Score</span><strong class="risk-alert-value">${report.executiveSummary.score} / ${report.executiveSummary.grade}</strong></div></div><div class="summary-grid"><div class="summary-card"><span>Critical</span><strong>${report.executiveSummary.severityCounts?.critical || 0}</strong></div><div class="summary-card"><span>Serious</span><strong>${report.executiveSummary.severityCounts?.serious || 0}</strong></div><div class="summary-card"><span>Moderate</span><strong>${report.executiveSummary.severityCounts?.moderate || 0}</strong></div><div class="summary-card"><span>Minor</span><strong>${report.executiveSummary.severityCounts?.minor || 0}</strong></div></div><div class="callout"><strong>Use fear responsibly:</strong> settlement risk belongs next to a path forward. Start with the top three fixes below, then work through the detailed findings by severity.</div><h2 style="margin-top:32px">Priority checklist</h2><ol class="checklist">${priorities}</ol><h2 style="margin-top:32px">Trend</h2><p>${escapeHtml(report.trend.summary)}</p></section>
+      <section class="page cover"><div class="brand">${logo}</div><p class="label">Paid ADA compliance report</p><h1>Consultant-grade accessibility audit</h1><p class="cover-url">${escapeHtml(report.url)}</p><div class="stat-grid"><div class="stat"><span>Score</span><strong>Score: ${report.executiveSummary.score}/100</strong><div class="muted" style="margin-top:8px">Grade: ${report.executiveSummary.grade}</div></div><div class="stat"><span>Risk</span><strong>${escapeHtml(report.executiveSummary.riskLevel)}</strong></div><div class="stat"><span>Report ID</span><strong style="font-size:17px">${escapeHtml(report.reportId)}</strong></div></div></section>
+      <section class="page"><h2>Executive summary</h2><div class="risk-alert-bar"><div class="risk-alert-item"><span class="risk-alert-label">Settlement range</span><strong class="risk-alert-value">${escapeHtml(report.executiveSummary.settlementRange)}</strong></div><div class="risk-alert-divider"></div><div class="risk-alert-item"><span class="risk-alert-label">Estimated fix time</span><strong class="risk-alert-value">${escapeHtml(report.executiveSummary.estimatedFixTime)}</strong></div><div class="risk-alert-divider"></div><div class="risk-alert-item"><span class="risk-alert-label">Risk level</span><strong class="risk-alert-value">${escapeHtml(report.executiveSummary.riskLevel)}</strong></div><div class="risk-alert-divider"></div><div class="risk-alert-item"><span class="risk-alert-label">Score</span><strong class="risk-alert-value">${report.executiveSummary.score}/100</strong></div><div class="risk-alert-divider"></div><div class="risk-alert-item"><span class="risk-alert-label">Grade</span><strong class="risk-alert-value">${report.executiveSummary.grade}</strong></div></div><div class="summary-grid"><div class="summary-card"><span>Critical</span><strong>${report.executiveSummary.severityCounts?.critical || 0}</strong></div><div class="summary-card"><span>Serious</span><strong>${report.executiveSummary.severityCounts?.serious || 0}</strong></div><div class="summary-card"><span>Moderate</span><strong>${report.executiveSummary.severityCounts?.moderate || 0}</strong></div><div class="summary-card"><span>Minor</span><strong>${report.executiveSummary.severityCounts?.minor || 0}</strong></div></div><div class="callout">Start with the fixes below, ordered by risk-reduction impact.</div><h2 style="margin-top:32px">Priority checklist</h2><ol class="checklist">${priorities}</ol><h2 style="margin-top:32px">Trend</h2><p>${escapeHtml(report.trend.summary)}</p></section>
       <section class="page"><h2>Page-by-page breakdown</h2><table><thead><tr><th>Page scanned</th><th>Violations</th><th>Density</th><th>Affected elements</th></tr></thead><tbody>${pages}</tbody></table><h2 style="margin-top:32px">Compliance badge</h2>${badge}</section>
       <section class="page"><h2>Full violation list</h2>${violations}</section>
     </body>

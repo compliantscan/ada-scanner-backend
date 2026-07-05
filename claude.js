@@ -18,6 +18,10 @@ function firstTarget(violation) {
   return Array.isArray(target) && target.length ? target[0] : String(target || '').trim();
 }
 
+function isColorContrastViolation(violation = {}) {
+  return String(violation.id || violation.ruleId || '').toLowerCase() === 'color-contrast';
+}
+
 function openingTag(html, tagName) {
   const match = String(html || '').match(new RegExp(`<${tagName}\\b[^>]*>`, 'i'));
   return match ? match[0] : '';
@@ -96,7 +100,6 @@ function concreteFallbackByRule(violation, badCode) {
 
 function fallbackFix(violation, badCode) {
   const effort = ['critical', 'serious'].includes(violation.impact) ? 'Requires developer' : '5 min fix';
-  const withThis = concreteFallbackByRule(violation, badCode);
   const help = String(violation.help || '').trim();
   const description = String(violation.description || '').trim();
   const criterion = violation._criterion || '';
@@ -119,6 +122,19 @@ function fallbackFix(violation, badCode) {
 
   const explanation = `${violationReason}${wcagRef}${impact}`;
 
+  if (isColorContrastViolation(violation)) {
+    return {
+      fixType: 'color-contrast',
+      colorContrast: null,
+      explanation: `${explanation} Real color values could not be derived. Manual review required.`,
+      effort,
+      estimatedMinutes: effort === '5 min fix' ? 5 : 30,
+      aiGenerated: false,
+      manualReviewRequired: true,
+    };
+  }
+
+  const withThis = concreteFallbackByRule(violation, badCode);
   return {
     replaceThis: badCode || firstTarget(violation) || '/* failing snippet unavailable from runtime scan */',
     withThis,
@@ -137,11 +153,24 @@ function hasDeployableCode(value) {
   return /<[\w-]+[\s>]|<\/[\w-]+>|[\w.#:[\]\-="' ]+\s*\{[\s\S]*:[\s\S]*;|aria-[\w-]+="[^"]+"/i.test(text);
 }
 
-function parseClaudeJson(text) {
+function parseClaudeJson(text, violation = {}) {
+  const isColorContrast = isColorContrastViolation(violation);
   const cleaned = String(text || '').replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/i, '').trim();
   const result = JSON.parse(cleaned);
   const allowedEfforts = ['5 min fix', 'Requires developer', 'Complex'];
-  const parsed = {
+  const parsed = isColorContrast ? {
+    fixType: 'color-contrast',
+    colorContrast: {
+      currentTextColor: String(result.currentTextColor || '').trim(),
+      currentBackgroundColor: String(result.currentBackgroundColor || '').trim() || null,
+      suggestedTextColor: String(result.suggestedTextColor || '').trim(),
+      resultingContrastRatio: String(result.resultingContrastRatio || '').trim(),
+    },
+    explanation: String(result.explanation || '').slice(0, 500),
+    effort: allowedEfforts.includes(result.effort) ? result.effort : 'Requires developer',
+    estimatedMinutes: Math.max(5, Math.min(480, Number(result.estimatedMinutes) || 30)),
+    aiGenerated: true,
+  } : {
     replaceThis: String(result.replaceThis || '').slice(0, 500),
     withThis: String(result.withThis || '').slice(0, 1000),
     explanation: String(result.explanation || '').slice(0, 500),
@@ -149,7 +178,13 @@ function parseClaudeJson(text) {
     estimatedMinutes: Math.max(5, Math.min(480, Number(result.estimatedMinutes) || 30)),
     aiGenerated: true,
   };
-  if (!hasDeployableCode(parsed.withThis)) {
+
+  if (isColorContrast) {
+    const hasRequiredContrastFields = Boolean(String(parsed.colorContrast.currentTextColor || '').trim()) && Boolean(String(parsed.colorContrast.suggestedTextColor || '').trim());
+    if (!hasRequiredContrastFields) {
+      throw new Error('Claude returned a non-deployable or placeholder fix.');
+    }
+  } else if (!hasDeployableCode(parsed.withThis)) {
     throw new Error('Claude returned a non-deployable or placeholder fix.');
   }
   return parsed;
@@ -157,6 +192,7 @@ function parseClaudeJson(text) {
 
 async function generateFix(violation, criterion, criterionDescription) {
   const badCode = String(violation.nodes?.[0]?.html || '').slice(0, 1000);
+  const isColorContrast = isColorContrastViolation(violation);
   const context = JSON.stringify({
     rule: violation.id,
     severity: violation.impact,
@@ -168,32 +204,37 @@ async function generateFix(violation, criterion, criterionDescription) {
   }).slice(0, 2000);
   const fingerprint = crypto.createHash('sha256').update(context).digest('hex');
   const cached = await getCachedAiFix(fingerprint);
-  if (cached && hasDeployableCode(cached.withThis)) return { ...cached, cached: true };
+  const cachedLooksValid = isColorContrast
+    ? Boolean(cached?.fixType === 'color-contrast' && cached?.colorContrast?.currentTextColor && cached?.colorContrast?.suggestedTextColor)
+    : hasDeployableCode(cached?.withThis);
+  if (cached && cachedLooksValid) return { ...cached, cached: true };
 
   if (!process.env.ANTHROPIC_API_KEY) return fallbackFix(violation, badCode);
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 20_000);
   try {
-    const response = await fetch(CLAUDE_ENDPOINT, {
-      method: 'POST',
-      headers: {
-        'x-api-key': process.env.ANTHROPIC_API_KEY,
-        'anthropic-version': '2023-06-01',
-        'content-type': 'application/json',
-      },
-      body: JSON.stringify({
-        model: process.env.ANTHROPIC_MODEL || DEFAULT_MODEL,
-        max_tokens: 600,
-        temperature: 0,
-        system: [
-          'You are a senior web accessibility engineer.',
-          'Return only valid JSON. Never invent a file path or line number.',
-          'Every fix must be deployable code: exact corrected HTML, JSX, CSS, or ARIA attributes.',
-          'Never output placeholders or instructions like "Describe this", "Fix any of the following", "Use better contrast", or "update the element".',
-        ].join(' '),
-        messages: [{
-          role: 'user',
-          content: `Generate the simplest deployable fix for this accessibility violation.
+    const systemPrompt = isColorContrast ? [
+      'You are a senior web accessibility engineer.',
+      'Return only valid JSON. Never invent a file path or line number.',
+      'For color-contrast violations, return plain color values and a contrast ratio as structured JSON fields: currentTextColor, currentBackgroundColor, suggestedTextColor, resultingContrastRatio, explanation. Do not return code.',
+      'For all other violations, every fix must be deployable code: exact corrected HTML, JSX, CSS, or ARIA attributes.',
+      'Never output placeholders or instructions like "Describe this", "Fix any of the following", "Use better contrast", or "update the element".',
+    ].join(' ') : [
+      'You are a senior web accessibility engineer.',
+      'Return only valid JSON. Never invent a file path or line number.',
+      'Every fix must be deployable code: exact corrected HTML, JSX, CSS, or ARIA attributes.',
+      'Never output placeholders or instructions like "Describe this", "Fix any of the following", "Use better contrast", or "update the element".',
+    ].join(' ');
+    const userPrompt = isColorContrast ? `Generate the simplest contrast fix for this accessibility violation.
+
+Rules:
+- Return JSON only with keys currentTextColor, currentBackgroundColor, suggestedTextColor, resultingContrastRatio, explanation, effort (exactly one of: 5 min fix, Requires developer, Complex), and estimatedMinutes.
+- currentBackgroundColor may be null if the background color cannot be detected.
+- Use concise, plain-language values and explanation.
+- Return only valid hex colors such as #111111.
+
+Violation context:
+${context}` : `Generate the simplest deployable fix for this accessibility violation.
 
 Rules:
 - withThis must contain exact corrected code, not advice.
@@ -209,7 +250,22 @@ Examples of acceptable withThis values:
 <main class="min-h-screen bg-muted">…</main> <!-- remove parent <div role="main"> -->
 
 Violation context:
-${context}`,
+${context}`;
+    const response = await fetch(CLAUDE_ENDPOINT, {
+      method: 'POST',
+      headers: {
+        'x-api-key': process.env.ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01',
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: process.env.ANTHROPIC_MODEL || DEFAULT_MODEL,
+        max_tokens: 600,
+        temperature: 0,
+        system: systemPrompt,
+        messages: [{
+          role: 'user',
+          content: userPrompt,
         }],
       }),
       signal: controller.signal,
@@ -217,7 +273,7 @@ ${context}`,
     const payload = await response.json();
     if (!response.ok) throw new Error(payload.error?.message || `Claude request failed (${response.status})`);
     const text = payload.content?.find(part => part.type === 'text')?.text;
-    const fix = parseClaudeJson(text);
+    const fix = parseClaudeJson(text, violation);
     await saveCachedAiFix(fingerprint, criterion, fix);
     return fix;
   } catch (error) {
