@@ -3,16 +3,28 @@ require('dotenv').config();
 
 const express = require('express');
 const cors = require('cors');
+const { createClient } = require('@supabase/supabase-js');
 const { scanUrl } = require('./scanner');
-const { saveScanResults, saveCollectedEmail, saveContactSubmission, getScanById, getActiveSubscriptionByTokenHash, claimScanForSubscriber, upsertSubscription, getSubscriptionByStripeCustomer } = require('./db');
+const { saveScanResults, createScanPlaceholder, updateScanWithResults, saveCollectedEmail, saveContactSubmission, getScanById, getUserScans, getActiveSubscriptionByTokenHash, claimScanForSubscriber, upsertSubscription, getSubscriptionByStripeCustomer } = require('./db');
 const { buildFreePaidBoundaryReport, buildPaidReport } = require('./paid-report-service');
 const { generatePaidReportPdf } = require('./report');
 const { sendPdfAttachmentEmail } = require('./email');
 const { bearerToken, generateAccessKey, hashSecret, safeHashMatch } = require('./entitlements');
 const { calculateScore } = require('./scoring');
+const requireAuth = require('./middleware/requireAuth');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+const supabaseAuthClient = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY || null,
+  {
+    auth: {
+      persistSession: false,
+      autoRefreshToken: false,
+    },
+  },
+);
 const allowAllOrigins = !process.env.CORS_ALLOWED_ORIGINS;
 const allowedOrigins = allowAllOrigins
   ? []
@@ -115,6 +127,23 @@ app.post('/webhook/stripe', express.raw({ type: 'application/json' }), async (re
 
 // Axe findings can include enough HTML snippets to exceed Express's 100 KB default.
 app.use(express.json({ limit: '5mb' }));
+
+async function optionalAuth(req, res, next) {
+  const authHeader = req.headers.authorization || '';
+  const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+
+  if (!token) {
+    return next();
+  }
+
+  const { data: { user }, error } = await supabaseAuthClient.auth.getUser(token);
+
+  if (!error && user) {
+    req.user = user;
+  }
+
+  next();
+}
 
 function isValidEmail(value) {
   return typeof value === 'string' && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value);
@@ -236,8 +265,198 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok', message: 'API is running' });
 });
 
+// Dashboard stats endpoint — returns aggregated data for the dashboard home page
+app.get('/dashboard/stats', requireAuth, async (req, res) => {
+  try {
+    const { supabase: db } = require('./db');
+    // Use service-role client if available for full read access
+    const { createClient: mkClient } = require('@supabase/supabase-js');
+    const adminKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+    const client = adminKey
+      ? mkClient(process.env.SUPABASE_URL, adminKey)
+      : db;
+
+    // Fetch only scans belonging to the authenticated user
+    const { data: scans, error } = await client
+      .from('scans')
+      .select('id, url, score, total_violations, violations_by_severity, affected_elements, pages_scanned, created_at, results_json')
+      .eq('user_id', req.user.id)
+      .order('created_at', { ascending: false });
+
+    if (error) throw error;
+
+    const rows = scans || [];
+
+    // ── Aggregate stats ────────────────────────────────────────────────────
+    // 1. Unique domains
+    const domains = new Set(rows.map(s => {
+      try { return new URL(s.url).hostname; } catch { return s.url; }
+    }));
+    const websitesScanned = domains.size;
+
+    // 2. Pages scanned — fall back to 1 per scan when no explicit count exists
+    const pagesScanned = rows.reduce((sum, s) => {
+      const pages = s.pages_scanned;
+      return sum + (Number.isFinite(pages) ? pages : 1);
+    }, 0);
+
+    // 3. Total violations
+    const totalViolations = rows.reduce((sum, s) => {
+      if (Number.isFinite(s.total_violations)) return sum + s.total_violations;
+      // fall back to results_json
+      const v = s.results_json?.violations;
+      return sum + (Array.isArray(v) ? v.length : 0);
+    }, 0);
+
+    // 4. Critical issues
+    const criticalIssues = rows.reduce((sum, s) => {
+      const bySeverity = s.violations_by_severity;
+      if (bySeverity && Number.isFinite(bySeverity.critical)) return sum + bySeverity.critical;
+      // fall back to results_json
+      const v = s.results_json?.violations;
+      if (Array.isArray(v)) return sum + v.filter(vio => vio.impact === 'critical').length;
+      return sum;
+    }, 0);
+
+    // 5. Average score — calculate from severity if score is missing
+    function calculateApproxScore(scan) {
+      // If a precomputed `score` exists and is numeric, use it.
+      if (Object.prototype.hasOwnProperty.call(scan, 'score') && Number.isFinite(scan.score)) return scan.score;
+      const bySev = scan.violations_by_severity;
+      if (bySev) {
+        const deduction =
+          (bySev.critical || 0) * 10 +
+          (bySev.serious  || 0) * 5  +
+          (bySev.moderate || 0) * 2  +
+          (bySev.minor    || 0) * 1;
+        return Math.max(0, Math.min(100, 100 - deduction));
+      }
+      const v = scan.results_json?.violations;
+      if (Array.isArray(v)) {
+        const deduction = v.reduce((d, vio) => {
+          if (vio.impact === 'critical') return d + 10;
+          if (vio.impact === 'serious')  return d + 5;
+          if (vio.impact === 'moderate') return d + 2;
+          if (vio.impact === 'minor')    return d + 1;
+          return d;
+        }, 0);
+        return Math.max(0, Math.min(100, 100 - deduction));
+      }
+      return 100;
+    }
+
+    const avgScore = rows.length
+      ? Math.round(rows.reduce((sum, s) => sum + calculateApproxScore(s), 0) / rows.length)
+      : 0;
+
+    // 6. Scans this month
+    const now = new Date();
+    const monthStart = new Date(now.getFullYear(), now.getMonth(), 1).toISOString();
+    const scansThisMonth = rows.filter(s => s.created_at >= monthStart).length;
+
+    // ── Recent reports (latest 5) ──────────────────────────────────────────
+    const latest5 = rows.slice(0, 5);
+
+    // Build a domain → previous-scan map for violation diff
+    const domainPrevViolations = {};
+    rows.slice(5).forEach(s => {
+      let host;
+      try { host = new URL(s.url).hostname; } catch { host = s.url; }
+      if (!(host in domainPrevViolations)) {
+        const v = Number.isFinite(s.total_violations)
+          ? s.total_violations
+          : (Array.isArray(s.results_json?.violations) ? s.results_json.violations.length : null);
+        domainPrevViolations[host] = v;
+      }
+    });
+
+    const recentReports = latest5.map(scan => {
+      let hostname;
+      try { hostname = new URL(scan.url).hostname; } catch { hostname = scan.url; }
+
+      const scanScore = calculateApproxScore(scan);
+      const violations = Number.isFinite(scan.total_violations)
+        ? scan.total_violations
+        : (Array.isArray(scan.results_json?.violations) ? scan.results_json.violations.length : 0);
+
+      const pages = scan.pages_scanned ?? 1;
+      const scanType = pages > 1 ? 'Full Website' : 'Single Page';
+      const scanTypeVariant = pages > 1 ? 'blue' : 'green';
+
+      let riskLevel, riskVariant;
+      if (scanScore >= 80)      { riskLevel = 'Low Risk';    riskVariant = 'green'; }
+      else if (scanScore >= 60) { riskLevel = 'Medium Risk'; riskVariant = 'orange'; }
+      else                      { riskLevel = 'High Risk';   riskVariant = 'red'; }
+
+      const prevViolations = domainPrevViolations[hostname] ?? null;
+      let violationsChange = null;
+      if (prevViolations !== null) {
+        violationsChange = violations - prevViolations; // positive = more, negative = fewer
+      }
+
+      return {
+        id: scan.id,
+        domain: hostname,
+        url: scan.url,
+        scanType,
+        scanTypeVariant,
+        pages: Number.isFinite(pages) ? pages : 1,
+        score: scanScore,
+        violations,
+        violationsChange,
+        riskLevel,
+        riskVariant,
+        scannedAt: scan.created_at,
+      };
+    });
+
+    return res
+      .set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate')
+      .json({
+      websitesScanned,
+      pagesScanned,
+      totalViolations,
+      criticalIssues,
+      avgScore,
+      scansThisMonth,
+      monthlyLimit: 100,
+      recentReports,
+      totalScans: rows.length,
+    });
+  } catch (err) {
+    console.error('[API] /dashboard/stats error:', err.message);
+    return res.status(500).json({ error: 'Failed to load dashboard stats', message: err.message });
+  }
+});
+
+app.get('/report/:scanId', async (req, res) => {
+  try {
+    const scanId = Number(req.params.scanId);
+    if (Number.isNaN(scanId)) {
+      return res.status(400).json({ error: 'Invalid scan ID' });
+    }
+
+    const scan = await getScanById(scanId);
+    if (!scan) {
+      return res.status(404).json({ error: 'Scan not found' });
+    }
+
+    const normalizedScan = {
+      ...scan,
+      results: scan.results || scan.result || scan.results_json || scan.scan_results || null,
+      result: scan.result || scan.results || scan.results_json || scan.scan_results || null,
+      scan_results: scan.scan_results || scan.results || scan.result || scan.results_json || null,
+    };
+
+    return res.json({ scan: normalizedScan });
+  } catch (error) {
+    console.error('[API] Failed to load public report:', error.message);
+    return res.status(500).json({ error: 'Unable to load report' });
+  }
+});
+
 // POST /scan endpoint - accepts URL and returns violations
-app.post('/scan', async (req, res) => {
+app.post('/scan', optionalAuth, async (req, res) => {
   try {
     const { url } = req.body;
 
@@ -287,7 +506,10 @@ app.post('/scan', async (req, res) => {
     // Save results to Supabase (best-effort)
     let savedRecord = null;
     try {
-      savedRecord = await saveScanResults(normalizedUrl, results, req.body.email || null, {
+      if (req.user?.id || req.user?.email) {
+        console.log('Authenticated scan user:', req.user?.id, req.user?.email);
+      }
+      savedRecord = await saveScanResults(normalizedUrl, results, req.user || null, {
         score,
         accessKeyHash: hashSecret(scanAccessKey),
         freeReportExpiresAt,
@@ -309,6 +531,8 @@ app.post('/scan', async (req, res) => {
 
 
     return res.json({
+      success: true,
+      scanId,
       tier: 'free',
       id: scanId,
       url: normalizedUrl,
@@ -331,6 +555,108 @@ app.post('/scan', async (req, res) => {
       error: 'Scan failed',
       message: error.message || 'Unexpected server error',
     });
+  }
+});
+
+app.get('/dashboard/report/:scanId', requireAuth, async (req, res) => {
+  try {
+    const scanId = Number(req.params.scanId);
+    if (Number.isNaN(scanId)) return res.status(400).json({ error: 'Invalid scan ID' });
+    const scan = await getScanById(scanId);
+    if (!scan) return res.status(404).json({ error: 'Scan not found' });
+    if (scan.user_id !== req.user.id) return res.status(403).json({ error: 'Forbidden' });
+    const report = await buildFreePaidBoundaryReport(scan);
+    return res.json({ scan: { ...scan, ...report } });
+  } catch (error) {
+    console.error('[API] Failed to load dashboard report:', error.message);
+    return res.status(500).json({ error: 'Unable to load report' });
+  }
+});
+
+app.get('/dashboard/scans', requireAuth, async (req, res) => {
+  try {
+    const scans = await getUserScans(req.user.id);
+    return res.json({ scans: scans || [] });
+  } catch (error) {
+    console.error('[API] Failed to load user scans:', error.message);
+    return res.status(500).json({ error: 'Unable to load scans' });
+  }
+});
+
+// Create a dashboard audit (queued) and run the scan in background. Returns immediately with audit id.
+app.post('/dashboard/scan', requireAuth, async (req, res) => {
+  try {
+    const { url } = req.body;
+    if (!url) return res.status(400).json({ error: 'Missing URL' });
+    let normalizedUrl;
+    try { normalizedUrl = normalizedScanUrl(url); } catch (err) { return res.status(400).json({ error: 'Invalid URL', message: err.message }); }
+
+    // Create placeholder record
+    const placeholder = await createScanPlaceholder(normalizedUrl, { id: req.user.id, email: req.user.email });
+    const scanId = placeholder?.id || null;
+
+    // Kick off background scan (do not await)
+    setImmediate(async () => {
+      try {
+        // mark as scanning
+        try {
+          await (require('./db').supabase)
+            .from('scans')
+            .update({ results_json: { _status: 'scanning', _progress: 5 } })
+            .eq('id', scanId);
+        } catch (e) {
+          console.warn('[BG-SCAN] Failed to mark scanning status:', e.message || e);
+        }
+
+        const results = await scanUrl(normalizedUrl);
+        const score = calculateScore(results.violations);
+
+        // Update scan row with final results
+        await updateScanWithResults(scanId, results, { score });
+        console.log(`[BG-SCAN] Background scan ${scanId} completed`);
+      } catch (err) {
+        console.error(`[BG-SCAN] Scan ${scanId} failed:`, err && (err.stack || err));
+        try {
+          await (require('./db').supabase)
+            .from('scans')
+            .update({ results_json: { _status: 'failed', _error: err.message || String(err) } })
+            .eq('id', scanId);
+        } catch (uerr) {
+          console.warn('[BG-SCAN] Failed to mark scan failed:', uerr.message || uerr);
+        }
+      }
+    });
+
+    return res.json({ success: true, scanId });
+  } catch (error) {
+    console.error('[API] /dashboard/scan error:', error && (error.stack || error));
+    return res.status(500).json({ error: 'Failed to create audit', message: error.message });
+  }
+});
+
+// Fetch raw scan row (status/progress) for dashboard audit polling
+app.get('/dashboard/scan/:scanId', requireAuth, async (req, res) => {
+  try {
+    const scanId = Number(req.params.scanId);
+    if (Number.isNaN(scanId)) return res.status(400).json({ error: 'Invalid scan ID' });
+    const scan = await getScanById(scanId);
+    if (!scan) return res.status(404).json({ error: 'Scan not found' });
+    if (scan.user_id !== req.user.id) return res.status(403).json({ error: 'Forbidden' });
+
+    // Backfill status for scans created before status tracking was implemented.
+    const resultsJson = scan.results_json || {};
+    if (!resultsJson._status && Array.isArray(resultsJson.violations)) {
+      scan.results_json = {
+        ...resultsJson,
+        _status: 'completed',
+        _progress: 100,
+      };
+    }
+
+    return res.json({ scan });
+  } catch (error) {
+    console.error('[API] /dashboard/scan/:id error:', error.message);
+    return res.status(500).json({ error: 'Unable to load scan', message: error.message });
   }
 });
 

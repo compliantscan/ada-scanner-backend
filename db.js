@@ -4,11 +4,11 @@ const { createClient } = require('@supabase/supabase-js');
 
 // Initialize Supabase client
 const supabaseUrl = process.env.SUPABASE_URL;
-const supabaseKey = process.env.SUPABASE_ANON_KEY;
+const supabaseKey = process.env.SUPABASE_ANON_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY || null;
 
 if (!supabaseUrl || !supabaseKey) {
   console.error('Missing Supabase credentials in environment variables');
-  console.error('Required: SUPABASE_URL and SUPABASE_ANON_KEY');
+  console.error('Required: SUPABASE_URL and either SUPABASE_ANON_KEY or SUPABASE_SERVICE_ROLE_KEY');
   process.exit(1);
 }
 
@@ -29,11 +29,13 @@ let aiFixCacheAvailable = true;
  * Save scan results to Supabase "scans" table
  * @param {string} url - The URL that was scanned
  * @param {object} results - Full axe-core results object
- * @param {string} userEmail - User email (optional for anonymous scans)
+ * @param {object|null} user - Authenticated user object (optional for anonymous scans)
+ * @param {object} metadata - Additional metadata for the scan row
  * @returns {Promise<object>} - Database record
  */
-async function saveScanResults(url, results, userEmail = null, metadata = {}) {
+async function saveScanResults(url, results, user = null, metadata = {}) {
   try {
+    const resolvedUser = typeof user === 'string' ? { id: null, email: user } : user;
     console.log(`[DB] Saving scan results for ${url}`);
 
     // Prepare summary data
@@ -56,7 +58,8 @@ async function saveScanResults(url, results, userEmail = null, metadata = {}) {
     const attempt = await client.from('scans').insert([
       {
         url,
-        user_email: userEmail,
+        user_id: resolvedUser?.id || null,
+        user_email: resolvedUser?.email || null,
         total_violations: results.violations.length,
         affected_elements: totalAffectedElements,
         violations_by_severity: violationsBySeverity,
@@ -84,7 +87,8 @@ async function saveScanResults(url, results, userEmail = null, metadata = {}) {
 
         const basePayload = {
           url,
-          user_email: userEmail,
+          user_id: resolvedUser?.id || null,
+          user_email: resolvedUser?.email || null,
           total_violations: results.violations.length,
           affected_elements: totalAffectedElements,
           violations_by_severity: violationsBySeverity,
@@ -96,7 +100,7 @@ async function saveScanResults(url, results, userEmail = null, metadata = {}) {
         };
 
         const makeFallbackPayload = cols => {
-          const payload = { url, user_email: userEmail, total_violations: results.violations.length, results_json: results };
+          const payload = { url, user_id: resolvedUser?.id || null, user_email: resolvedUser?.email || null, total_violations: results.violations.length, results_json: results };
           if (!cols.includes('affected_elements')) payload.affected_elements = totalAffectedElements;
           if (!cols.includes('violations_by_severity')) payload.violations_by_severity = violationsBySeverity;
           if (!cols.includes('score')) payload.score = metadata.score ?? null;
@@ -170,6 +174,98 @@ async function saveScanResults(url, results, userEmail = null, metadata = {}) {
 }
 
 /**
+ * Create a placeholder scan row (queued) and return the created record.
+ * results_json contains a lightweight status object so clients can poll.
+ */
+async function createScanPlaceholder(url, user = null) {
+  try {
+    const client = supabaseAdmin || supabase;
+    const resolvedUser = typeof user === 'string' ? { id: null, email: user } : user;
+    const payload = {
+      url,
+      user_id: resolvedUser?.id || null,
+      user_email: resolvedUser?.email || null,
+      results_json: { _status: 'queued', _progress: 0 },
+      created_at: new Date().toISOString(),
+    };
+    const { data, error } = await client.from('scans').insert([payload]).select();
+    if (error) {
+      console.error('[DB] createScanPlaceholder insert error:', error.message || error);
+      throw error;
+    }
+    return Array.isArray(data) && data.length ? data[0] : null;
+  } catch (err) {
+    console.error('[DB] createScanPlaceholder failed:', err.message || err);
+    throw err;
+  }
+}
+
+/**
+ * Update an existing scan row with final results after a background scan completes.
+ */
+async function updateScanWithResults(scanId, results, metadata = {}) {
+  try {
+    const client = supabaseAdmin || supabase;
+
+    const violationsBySeverity = {
+      critical: (results.violations || []).filter(v => v.impact === 'critical').length,
+      serious: (results.violations || []).filter(v => v.impact === 'serious').length,
+      moderate: (results.violations || []).filter(v => v.impact === 'moderate').length,
+      minor: (results.violations || []).filter(v => v.impact === 'minor').length,
+    };
+    const totalAffectedElements = (results.violations || []).reduce(
+      (sum, violation) => sum + (Array.isArray(violation.nodes) ? violation.nodes.length : 0),
+      0
+    );
+
+    const payload = {
+      results_json: {
+        ...results,
+        _status: 'completed',
+        _progress: 100,
+      },
+      total_violations: Array.isArray(results.violations) ? results.violations.length : null,
+      affected_elements: totalAffectedElements,
+      violations_by_severity: violationsBySeverity,
+      updated_at: new Date().toISOString(),
+    };
+    // Only include score if the caller provided it to avoid referencing a
+    // missing column in older schemas.
+    if (metadata && Object.prototype.hasOwnProperty.call(metadata, 'score')) {
+      payload.score = metadata.score;
+    }
+
+    try {
+      const { data, error } = await client.from('scans').update(payload).eq('id', scanId).select();
+      if (error) {
+        throw error;
+      }
+      return Array.isArray(data) && data.length ? data[0] : null;
+    } catch (err) {
+      const msg = (err && err.message) || String(err);
+      console.warn('[DB] updateScanWithResults update failed, attempting minimal fallback:', msg);
+      // Fallback: update only the minimal fields that are unlikely to be missing
+      const minimal = {
+        results_json: payload.results_json,
+        total_violations: payload.total_violations,
+        affected_elements: payload.affected_elements,
+        violations_by_severity: payload.violations_by_severity,
+        updated_at: payload.updated_at,
+      };
+      const { data: fbData, error: fbErr } = await client.from('scans').update(minimal).eq('id', scanId).select();
+      if (fbErr) {
+        console.error('[DB] updateScanWithResults minimal fallback failed:', fbErr.message || fbErr);
+        throw fbErr;
+      }
+      return Array.isArray(fbData) && fbData.length ? fbData[0] : null;
+    }
+  } catch (err) {
+    console.error('[DB] updateScanWithResults failed:', err.message || err);
+    throw err;
+  }
+}
+
+/**
  * Save a collected email to Supabase "emails_collected" table
  * @param {string} email
  * @param {string} url
@@ -239,15 +335,16 @@ async function saveCollectedEmail(email, url) {
 
 /**
  * Get all scans for a user (requires auth)
- * @param {string} userEmail - User email
+ * @param {string} userId - User ID
  * @returns {Promise<array>} - Array of scans
  */
-async function getUserScans(userEmail) {
+async function getUserScans(userId) {
   try {
-    const { data, error } = await supabase
+    const client = supabaseAdmin || supabase;
+    const { data, error } = await client
       .from('scans')
       .select('*')
-      .eq('user_email', userEmail)
+      .eq('user_id', userId)
       .order('created_at', { ascending: false });
 
     if (error) throw error;
@@ -266,29 +363,48 @@ async function getUserScans(userEmail) {
 async function getScanById(scanId) {
   try {
     const client = supabaseAdmin || supabase;
-    const { data, error } = await client
-      .from('scans')
-      .select('*')
-      .eq('id', scanId)
-      .limit(1);
-
-    if (error) throw error;
-    return Array.isArray(data) && data.length ? data[0] : null;
+    // Try a full select first. If the DB schema has changed (missing columns),
+    // PostgREST can return an error like "Could not find the 'score' column".
+    // In that case, fall back to selecting a minimal set of columns that we
+    // know are safe to query (id, url, results_json, created_at, user_email).
+    try {
+      const { data, error } = await client
+        .from('scans')
+        .select('*')
+        .eq('id', scanId)
+        .limit(1);
+      if (error) throw error;
+      return Array.isArray(data) && data.length ? data[0] : null;
+    } catch (err) {
+      const msg = (err && err.message) || String(err);
+      console.warn('[DB] getScanById full select failed:', msg);
+      // Fallback to minimal safe columns
+      const { data: fallbackData, error: fallbackError } = await client
+        .from('scans')
+        .select('id,url,user_id,user_email,results_json,created_at,total_violations,violations_by_severity,affected_elements')
+        .eq('id', scanId)
+        .limit(1);
+      if (fallbackError) {
+        console.error('[DB] getScanById fallback select failed:', fallbackError.message || fallbackError);
+        throw fallbackError;
+      }
+      return Array.isArray(fallbackData) && fallbackData.length ? fallbackData[0] : null;
+    }
   } catch (error) {
     console.error('[DB] Failed to fetch scan:', error.message);
     throw error;
   }
 }
 
-async function getScanHistory(url, userEmail, limit = 20) {
+async function getScanHistory(url, userId, limit = 20) {
   const client = supabaseAdmin || supabase;
   let query = client
     .from('scans')
-    .select('id,url,user_email,score,results_json,created_at')
+    .select('id,url,user_id,user_email,score,results_json,created_at')
     .eq('url', url)
     .order('created_at', { ascending: true })
     .limit(limit);
-  if (userEmail) query = query.eq('user_email', userEmail);
+  if (userId) query = query.eq('user_id', userId);
   const { data, error } = await query;
   if (error) throw error;
   return data || [];
@@ -425,6 +541,8 @@ async function saveContactSubmission(name, email, website, message) {
 
 module.exports = {
   saveScanResults,
+  createScanPlaceholder,
+  updateScanWithResults,
   saveCollectedEmail,
   saveContactSubmission,
   getUserScans,

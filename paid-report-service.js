@@ -128,9 +128,9 @@ async function buildReport(scanRecord, options = {}) {
     .map((item, index) => ({ ...item, rank: index + 1 }));
 
   let history = [];
-  if (options.includeHistory && options.subscription?.user_email) {
+  if (options.includeHistory && (options.subscription?.user_id || scanRecord.user_id)) {
     try {
-      history = await getScanHistory(scanRecord.url, options.subscription.user_email, 20);
+      history = await getScanHistory(scanRecord.url, options.subscription?.user_id || scanRecord.user_id, 20);
     } catch (error) {
       console.warn('[REPORT] Trend history unavailable:', error.message);
     }
