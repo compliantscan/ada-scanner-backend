@@ -12,6 +12,22 @@ const { sendPdfAttachmentEmail } = require('./email');
 const { bearerToken, generateAccessKey, hashSecret, safeHashMatch } = require('./entitlements');
 const { calculateScore } = require('./scoring');
 const requireAuth = require('./middleware/requireAuth');
+const { initCronJobs, runMonitorScan } = require('./cron');
+const {
+  addMonitoredSite,
+  getMonitoredSitesByUser,
+  getMonitoredSiteById,
+  updateMonitoredSite,
+  deleteMonitoredSite,
+  getMonitoringScans,
+  getLatestMonitoringScan,
+  getAlertsByUser,
+  getAlertsByMonitor,
+  markAlertRead
+} = require('./db');
+
+// Start cron jobs
+initCronJobs();
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -279,7 +295,7 @@ app.get('/dashboard/stats', requireAuth, async (req, res) => {
     // Fetch only scans belonging to the authenticated user
     const { data: scans, error } = await client
       .from('scans')
-      .select('id, url, score, total_violations, violations_by_severity, affected_elements, pages_scanned, created_at, results_json')
+      .select('id, url, score, total_violations, violations_by_severity, affected_elements, created_at')
       .eq('user_id', req.user.id)
       .order('created_at', { ascending: false });
 
@@ -586,13 +602,17 @@ app.get('/dashboard/scans', requireAuth, async (req, res) => {
 // Create a dashboard audit (queued) and run the scan in background. Returns immediately with audit id.
 app.post('/dashboard/scan', requireAuth, async (req, res) => {
   try {
-    const { url } = req.body;
+    const { url, scan_type = 'single', report_type = 'executive' } = req.body;
     if (!url) return res.status(400).json({ error: 'Missing URL' });
     let normalizedUrl;
     try { normalizedUrl = normalizedScanUrl(url); } catch (err) { return res.status(400).json({ error: 'Invalid URL', message: err.message }); }
 
-    // Create placeholder record
-    const placeholder = await createScanPlaceholder(normalizedUrl, { id: req.user.id, email: req.user.email });
+    // Create placeholder record, storing scan_type and report_type
+    const placeholder = await createScanPlaceholder(
+      normalizedUrl,
+      { id: req.user.id, email: req.user.email },
+      { scan_type, report_type }
+    );
     const scanId = placeholder?.id || null;
 
     // Kick off background scan (do not await)
@@ -634,6 +654,172 @@ app.post('/dashboard/scan', requireAuth, async (req, res) => {
   }
 });
 
+// GET /dashboard/monitoring - Get monitored sites for user
+app.get('/dashboard/monitoring', requireAuth, async (req, res) => {
+  try {
+    const sites = await getMonitoredSitesByUser(req.user.id);
+    
+    // Add summary stats
+    let healthy = 0;
+    let warning = 0;
+    let critical = 0;
+    for (const s of sites) {
+      if (s.status === 'healthy') healthy++;
+      if (s.status === 'warning') warning++;
+      if (s.status === 'critical') critical++;
+    }
+    
+    return res.json({ sites, summary: { healthy, warning, critical, total: sites.length } });
+  } catch (error) {
+    console.error('[API] /dashboard/monitoring GET error:', error);
+    return res.status(500).json({ error: 'Unable to fetch monitored sites' });
+  }
+});
+
+// POST /dashboard/monitoring - Add a site to monitor
+app.post('/dashboard/monitoring', requireAuth, async (req, res) => {
+  try {
+    const { url, frequency, pages_monitored, alerts_enabled } = req.body;
+    if (!url) return res.status(400).json({ error: 'Missing URL' });
+    let normalizedUrl;
+    try { normalizedUrl = normalizedScanUrl(url); } catch (err) { return res.status(400).json({ error: 'Invalid URL', message: err.message }); }
+    
+    const site = await addMonitoredSite(req.user.id, normalizedUrl, frequency, pages_monitored, alerts_enabled);
+    return res.json({ success: true, site });
+  } catch (error) {
+    console.error('[API] /dashboard/monitoring POST error:', error);
+    return res.status(500).json({ error: 'Failed to add monitored site', message: error.message });
+  }
+});
+
+// GET /dashboard/monitoring/alerts - Get all alerts for user
+app.get('/dashboard/monitoring/alerts', requireAuth, async (req, res) => {
+  try {
+    const alerts = await getAlertsByUser(req.user.id);
+    return res.json({ alerts });
+  } catch (error) {
+    console.error('[API] /dashboard/monitoring/alerts GET error:', error);
+    return res.status(500).json({ error: 'Failed to get alerts', message: error.message });
+  }
+});
+
+// POST /dashboard/monitoring/alerts/:id/read - Mark alert as read
+app.post('/dashboard/monitoring/alerts/:id/read', requireAuth, async (req, res) => {
+  try {
+    const alert = await markAlertRead(req.params.id);
+    return res.json({ success: true, alert });
+  } catch (error) {
+    console.error('[API] /dashboard/monitoring/alerts/:id/read error:', error);
+    return res.status(500).json({ error: 'Failed to mark alert read' });
+  }
+});
+
+// GET /dashboard/monitoring/:id - Get specific site, its scans, and its alerts
+app.get('/dashboard/monitoring/:id', requireAuth, async (req, res) => {
+  try {
+    const site = await getMonitoredSiteById(req.params.id);
+    if (!site) return res.status(404).json({ error: 'Not found' });
+    if (site.user_id !== req.user.id) return res.status(403).json({ error: 'Forbidden' });
+
+    const scans = await getMonitoringScans(site.id, 12);
+    const alerts = await getAlertsByMonitor(site.id);
+
+    return res.json({ site, scans, alerts });
+  } catch (error) {
+    console.error('[API] /dashboard/monitoring/:id GET error:', error);
+    return res.status(500).json({ error: 'Failed to fetch site', message: error.message });
+  }
+});
+
+// PUT /dashboard/monitoring/:id - Update site
+app.put('/dashboard/monitoring/:id', requireAuth, async (req, res) => {
+  try {
+    const site = await getMonitoredSiteById(req.params.id);
+    if (!site) return res.status(404).json({ error: 'Not found' });
+    if (site.user_id !== req.user.id) return res.status(403).json({ error: 'Forbidden' });
+
+    const { frequency, status, alerts_enabled } = req.body;
+    const updates = {};
+    if (frequency) updates.frequency = frequency;
+    if (status) updates.status = status;
+    if (alerts_enabled !== undefined) updates.alerts_enabled = alerts_enabled;
+
+    const updatedSite = await updateMonitoredSite(site.id, updates);
+    return res.json({ success: true, site: updatedSite });
+  } catch (error) {
+    console.error('[API] /dashboard/monitoring/:id PUT error:', error);
+    return res.status(500).json({ error: 'Failed to update site', message: error.message });
+  }
+});
+
+// DELETE /dashboard/monitoring/:id - Remove site
+app.delete('/dashboard/monitoring/:id', requireAuth, async (req, res) => {
+  try {
+    const site = await getMonitoredSiteById(req.params.id);
+    if (!site) return res.status(404).json({ error: 'Not found' });
+    if (site.user_id !== req.user.id) return res.status(403).json({ error: 'Forbidden' });
+
+    await deleteMonitoredSite(site.id);
+    return res.json({ success: true });
+  } catch (error) {
+    console.error('[API] /dashboard/monitoring/:id DELETE error:', error);
+    return res.status(500).json({ error: 'Failed to delete site', message: error.message });
+  }
+});
+
+// POST /dashboard/monitoring/:id/scan - Run Scan Now
+app.post('/dashboard/monitoring/:id/scan', requireAuth, async (req, res) => {
+  try {
+    const site = await getMonitoredSiteById(req.params.id);
+    if (!site) return res.status(404).json({ error: 'Not found' });
+    if (site.user_id !== req.user.id) return res.status(403).json({ error: 'Forbidden' });
+
+    // Run async to not block request
+    runMonitorScan(site).catch(err => console.error('Background monitor scan failed:', err));
+
+    return res.json({ success: true, message: 'Scan started' });
+  } catch (error) {
+    console.error('[API] /dashboard/monitoring/:id/scan POST error:', error);
+    return res.status(500).json({ error: 'Failed to start scan', message: error.message });
+  }
+});
+
+// GET /dashboard/monitoring/:id/compare - Compare latest 2 scans
+app.get('/dashboard/monitoring/:id/compare', requireAuth, async (req, res) => {
+  try {
+    const site = await getMonitoredSiteById(req.params.id);
+    if (!site) return res.status(404).json({ error: 'Not found' });
+    if (site.user_id !== req.user.id) return res.status(403).json({ error: 'Forbidden' });
+
+    const scans = await getMonitoringScans(site.id, 2);
+    if (scans.length < 2) {
+      return res.json({ error: 'Need at least 2 scans to compare' });
+    }
+
+    const current = scans[0];
+    const previous = scans[1];
+
+    const prevRuleIds = new Set((previous.violations_json || []).map(v => v.id));
+    const currRuleIds = new Set((current.violations_json || []).map(v => v.id));
+
+    const newIssues = (current.violations_json || []).filter(v => !prevRuleIds.has(v.id));
+    const fixedIssues = (previous.violations_json || []).filter(v => !currRuleIds.has(v.id));
+
+    const scoreDiff = current.score - previous.score;
+
+    return res.json({
+      current,
+      previous,
+      newIssues,
+      fixedIssues,
+      scoreDiff
+    });
+  } catch (error) {
+    console.error('[API] /dashboard/monitoring/:id/compare GET error:', error);
+    return res.status(500).json({ error: 'Failed to compare scans', message: error.message });
+  }
+});
+
 // Fetch raw scan row (status/progress) for dashboard audit polling
 app.get('/dashboard/scan/:scanId', requireAuth, async (req, res) => {
   try {
@@ -657,6 +843,23 @@ app.get('/dashboard/scan/:scanId', requireAuth, async (req, res) => {
   } catch (error) {
     console.error('[API] /dashboard/scan/:id error:', error.message);
     return res.status(500).json({ error: 'Unable to load scan', message: error.message });
+  }
+});
+
+// Delete a scan
+app.delete('/dashboard/scan/:id', requireAuth, async (req, res) => {
+  try {
+    const scanId = Number(req.params.id);
+    if (Number.isNaN(scanId)) return res.status(400).json({ error: 'Invalid scan ID' });
+    const scan = await getScanById(scanId);
+    if (!scan) return res.status(404).json({ error: 'Scan not found' });
+    if (scan.user_id !== req.user.id) return res.status(403).json({ error: 'Forbidden' });
+    
+    await require('./db').deleteScanById(scanId);
+    return res.json({ success: true });
+  } catch (error) {
+    console.error('[API] /dashboard/scan DELETE error:', error.message);
+    return res.status(500).json({ error: 'Unable to delete scan', message: error.message });
   }
 });
 

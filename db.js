@@ -177,7 +177,7 @@ async function saveScanResults(url, results, user = null, metadata = {}) {
  * Create a placeholder scan row (queued) and return the created record.
  * results_json contains a lightweight status object so clients can poll.
  */
-async function createScanPlaceholder(url, user = null) {
+async function createScanPlaceholder(url, user = null, extra = {}) {
   try {
     const client = supabaseAdmin || supabase;
     const resolvedUser = typeof user === 'string' ? { id: null, email: user } : user;
@@ -188,8 +188,21 @@ async function createScanPlaceholder(url, user = null) {
       results_json: { _status: 'queued', _progress: 0 },
       created_at: new Date().toISOString(),
     };
+    // Store scan_type and report_type if provided (best-effort: ignore column-missing errors)
+    if (extra.scan_type) payload.scan_type = extra.scan_type;
+    if (extra.report_type) payload.report_type = extra.report_type;
     const { data, error } = await client.from('scans').insert([payload]).select();
     if (error) {
+      // If the column doesn't exist yet, retry without optional fields
+      if (error.code === 'PGRST204' || /scan_type|report_type/.test(error.message || '')) {
+        console.warn('[DB] scan_type/report_type columns missing, retrying without them');
+        const { data: data2, error: error2 } = await client.from('scans').insert([{
+          url, user_id: payload.user_id, user_email: payload.user_email,
+          results_json: payload.results_json, created_at: payload.created_at,
+        }]).select();
+        if (error2) throw error2;
+        return Array.isArray(data2) && data2.length ? data2[0] : null;
+      }
       console.error('[DB] createScanPlaceholder insert error:', error.message || error);
       throw error;
     }
@@ -343,7 +356,7 @@ async function getUserScans(userId) {
     const client = supabaseAdmin || supabase;
     const { data, error } = await client
       .from('scans')
-      .select('*')
+      .select('id, url, user_id, user_email, total_violations, violations_by_severity, affected_elements, score, created_at, updated_at')
       .eq('user_id', userId)
       .order('created_at', { ascending: false });
 
@@ -526,6 +539,12 @@ async function getSubscriptionByStripeCustomer(stripeCustomerId) {
   return data?.[0] || null;
 }
 
+async function deleteScanById(scanId) {
+  const client = supabaseAdmin || supabase;
+  const { error } = await client.from('scans').delete().eq('id', scanId);
+  if (error) throw error;
+}
+
 async function saveContactSubmission(name, email, website, message) {
   const client = supabaseAdmin || supabase;
   const { data, error } = await client.from('contact_submissions').insert([{
@@ -539,6 +558,156 @@ async function saveContactSubmission(name, email, website, message) {
   return data?.[0];
 }
 
+async function addMonitoredSite(userId, url, frequency = 'weekly', pagesMonitored = 1, alertsEnabled = true) {
+  const client = supabaseAdmin || supabase;
+  const nextScan = new Date();
+  nextScan.setMinutes(nextScan.getMinutes() + 5); // Schedule first scan 5 mins from now
+  const { data, error } = await client.from('monitored_sites').insert([{
+    user_id: userId,
+    url,
+    frequency,
+    pages_monitored: pagesMonitored,
+    alerts_enabled: alertsEnabled,
+    status: 'pending',
+    next_scan_at: nextScan.toISOString(),
+  }]).select();
+  if (error) throw error;
+  return data?.[0];
+}
+
+async function getMonitoredSitesByUser(userId) {
+  const client = supabaseAdmin || supabase;
+  const { data, error } = await client
+    .from('monitored_sites')
+    .select('*')
+    .eq('user_id', userId)
+    .order('created_at', { ascending: false });
+  if (error) throw error;
+  return data || [];
+}
+
+async function getMonitoredSiteById(siteId) {
+  const client = supabaseAdmin || supabase;
+  const { data, error } = await client
+    .from('monitored_sites')
+    .select('*')
+    .eq('id', siteId)
+    .single();
+  if (error && error.code !== 'PGRST116') throw error;
+  return data;
+}
+
+async function updateMonitoredSite(siteId, updates) {
+  const client = supabaseAdmin || supabase;
+  const { data, error } = await client
+    .from('monitored_sites')
+    .update({ ...updates, updated_at: new Date().toISOString() })
+    .eq('id', siteId)
+    .select();
+  if (error) throw error;
+  return data?.[0];
+}
+
+async function deleteMonitoredSite(siteId) {
+  const client = supabaseAdmin || supabase;
+  const { error } = await client
+    .from('monitored_sites')
+    .delete()
+    .eq('id', siteId);
+  if (error) throw error;
+}
+
+async function getSitesDueForScan() {
+  if (!supabaseAdmin) throw new Error('Requires SUPABASE_SERVICE_ROLE_KEY.');
+  const now = new Date().toISOString();
+  const { data, error } = await supabaseAdmin
+    .from('monitored_sites')
+    .select('*')
+    .lte('next_scan_at', now)
+    .neq('status', 'paused');
+  if (error) throw error;
+  return data || [];
+}
+
+async function addMonitoringScan(monitorId, auditId, scanData) {
+  const client = supabaseAdmin || supabase;
+  const { data, error } = await client.from('monitoring_scans').insert([{
+    monitor_id: monitorId,
+    audit_id: auditId,
+    score: scanData.score,
+    critical_count: scanData.critical_count,
+    serious_count: scanData.serious_count,
+    moderate_count: scanData.moderate_count,
+    minor_count: scanData.minor_count,
+    pages_scanned: scanData.pages_scanned,
+    violations_json: scanData.violations_json,
+  }]).select();
+  if (error) throw error;
+  return data?.[0];
+}
+
+async function getMonitoringScans(monitorId, limit = 12) {
+  const client = supabaseAdmin || supabase;
+  const { data, error } = await client
+    .from('monitoring_scans')
+    .select('*')
+    .eq('monitor_id', monitorId)
+    .order('created_at', { ascending: false })
+    .limit(limit);
+  if (error) throw error;
+  return data || [];
+}
+
+async function getLatestMonitoringScan(monitorId) {
+  const scans = await getMonitoringScans(monitorId, 1);
+  return scans.length > 0 ? scans[0] : null;
+}
+
+async function addMonitoringAlert(monitorId, type, severity, message) {
+  const client = supabaseAdmin || supabase;
+  const { data, error } = await client.from('monitoring_alerts').insert([{
+    monitor_id: monitorId,
+    type,
+    severity,
+    message,
+  }]).select();
+  if (error) throw error;
+  return data?.[0];
+}
+
+async function getAlertsByUser(userId) {
+  const client = supabaseAdmin || supabase;
+  const { data, error } = await client
+    .from('monitoring_alerts')
+    .select('*, monitored_sites!inner(user_id, url)')
+    .eq('monitored_sites.user_id', userId)
+    .order('created_at', { ascending: false });
+  if (error) throw error;
+  return data || [];
+}
+
+async function getAlertsByMonitor(monitorId) {
+  const client = supabaseAdmin || supabase;
+  const { data, error } = await client
+    .from('monitoring_alerts')
+    .select('*')
+    .eq('monitor_id', monitorId)
+    .order('created_at', { ascending: false });
+  if (error) throw error;
+  return data || [];
+}
+
+async function markAlertRead(alertId) {
+  const client = supabaseAdmin || supabase;
+  const { data, error } = await client
+    .from('monitoring_alerts')
+    .update({ read: true })
+    .eq('id', alertId)
+    .select();
+  if (error) throw error;
+  return data?.[0];
+}
+
 module.exports = {
   saveScanResults,
   createScanPlaceholder,
@@ -547,6 +716,7 @@ module.exports = {
   saveContactSubmission,
   getUserScans,
   getScanById,
+  deleteScanById,
   getScanHistory,
   getActiveSubscriptionByTokenHash,
   claimScanForSubscriber,
@@ -554,5 +724,18 @@ module.exports = {
   saveCachedAiFix,
   upsertSubscription,
   getSubscriptionByStripeCustomer,
+  addMonitoredSite,
+  getMonitoredSitesByUser,
+  getMonitoredSiteById,
+  updateMonitoredSite,
+  deleteMonitoredSite,
+  getSitesDueForScan,
+  addMonitoringScan,
+  getMonitoringScans,
+  getLatestMonitoringScan,
+  addMonitoringAlert,
+  getAlertsByUser,
+  getAlertsByMonitor,
+  markAlertRead,
   supabase,
 };
