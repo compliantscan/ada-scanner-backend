@@ -52,7 +52,7 @@ const corsOptions = {
     if (allowAllOrigins || allowedOrigins.includes(origin)) return callback(null, true);
     callback(new Error(`CORS origin denied: ${origin}`));
   },
-  methods: ['GET', 'POST', 'OPTIONS'],
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
   preflightContinue: false,
   optionsSuccessStatus: 204,

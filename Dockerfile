@@ -1,10 +1,10 @@
 FROM node:24-slim
 
-# Install system dependencies required by Playwright
+# Install system dependencies required by Playwright / Chromium
 RUN apt-get update && apt-get install -y \
     libnss3 \
     libxss1 \
-    libasound2 \
+    libasound2t64 \
     libatk1.0-0 \
     libatk-bridge2.0-0 \
     libcups2 \
@@ -12,14 +12,14 @@ RUN apt-get update && apt-get install -y \
     libexpat1 \
     libfontconfig1 \
     libgbm1 \
-    libgcc1 \
-    libgconf-2-4 \
-    libgdk-pixbuf2.0-0 \
+    libgcc-s1 \
     libglib2.0-0 \
     libgtk-3-0 \
     libharfbuzz0b \
     libpango-1.0-0 \
     libpangoft2-1.0-0 \
+    libvpx9 \
+    libwebp7 \
     libx11-6 \
     libx11-xcb1 \
     libxcb1 \
@@ -32,6 +32,9 @@ RUN apt-get update && apt-get install -y \
     libxrandr2 \
     libxrender1 \
     libxslt1.1 \
+    libxkbcommon0 \
+    fonts-liberation \
+    wget \
     xfonts-encodings \
     xfonts-utils \
     --no-install-recommends && \
@@ -45,7 +48,7 @@ COPY package*.json ./
 # Install npm dependencies
 RUN npm install --production
 
-# Install Playwright browsers
+# Install Playwright browsers (chromium only, with all its OS deps)
 RUN npx playwright install --with-deps chromium
 
 # Copy source code
