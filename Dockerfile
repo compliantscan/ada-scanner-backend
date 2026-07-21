@@ -4,7 +4,7 @@ FROM node:24-slim
 RUN apt-get update && apt-get install -y \
     libnss3 \
     libxss1 \
-    libasound2t64 \
+    libasound2 \
     libatk1.0-0 \
     libatk-bridge2.0-0 \
     libcups2 \
@@ -18,7 +18,7 @@ RUN apt-get update && apt-get install -y \
     libharfbuzz0b \
     libpango-1.0-0 \
     libpangoft2-1.0-0 \
-    libvpx9 \
+    libvpx7 \
     libwebp7 \
     libx11-6 \
     libx11-xcb1 \
