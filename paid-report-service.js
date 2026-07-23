@@ -154,6 +154,7 @@ async function buildReport(scanRecord, options = {}) {
     reportId,
     scanId: scanRecord.id,
     url: scanRecord.url,
+    homepageScreenshot: results.homepageScreenshot || null,
     generatedAt: new Date().toISOString(),
     executiveSummary: {
       score,
@@ -168,6 +169,7 @@ async function buildReport(scanRecord, options = {}) {
     priorityChecklist: priorities,
     pages: [{
       url: scanRecord.url,
+      homepageScreenshot: results.homepageScreenshot || null,
       violations: violations.length,
       density: violations.length,
       affectedElements: violations.reduce((sum, v) => sum + (v.affectedElements || 0), 0),

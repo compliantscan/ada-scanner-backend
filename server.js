@@ -555,6 +555,7 @@ app.post('/scan', optionalAuth, async (req, res) => {
       timestamp: now.toISOString(),
       expiresAt: new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000).toISOString(),
       reportId: fullReport.reportId,
+      homepageScreenshot: fullReport.homepageScreenshot,
       executiveSummary: fullReport.executiveSummary,
       priorityChecklist: fullReport.priorityChecklist,
       violations: fullReport.violations,

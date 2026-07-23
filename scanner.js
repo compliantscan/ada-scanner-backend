@@ -109,6 +109,25 @@ async function scanUrl(url) {
       throw new ScanError('page crashed during page load', 500);
     }
 
+    // Keep an unmodified view of the scanned homepage for the results card.
+    // This is captured before any issue highlighting is added below.
+    let homepageScreenshot = null;
+    try {
+      await page.evaluate(() => window.scrollTo(0, 0));
+      await page.waitForTimeout(250);
+      const screenshot = await page.screenshot({
+        type: 'jpeg',
+        quality: 76,
+        fullPage: false,
+        animations: 'disabled',
+        caret: 'hide',
+        timeout: 7000,
+      });
+      homepageScreenshot = `data:image/jpeg;base64,${screenshot.toString('base64')}`;
+    } catch (screenshotError) {
+      console.warn('[SCAN] Could not capture homepage preview:', screenshotError.message);
+    }
+
     console.log('Running accessibility scan...');
     // Wrap Axe analysis in a timeout to prevent hanging on complex sites
     const axeTimeoutMs = 120000;
@@ -128,6 +147,7 @@ async function scanUrl(url) {
       }
       throw axeErr;
     }
+    results.homepageScreenshot = homepageScreenshot;
     
     console.log('\n========== SCAN RESULTS ==========\n');
     console.log(`URL: ${url}`);
