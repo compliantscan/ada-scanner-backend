@@ -590,6 +590,25 @@ app.get('/dashboard/report/:scanId', requireAuth, async (req, res) => {
   }
 });
 
+app.post('/dashboard/report/:scanId/pdf', requireAuth, async (req, res) => {
+  try {
+    const scanId = Number(req.params.scanId);
+    if (Number.isNaN(scanId)) return res.status(400).json({ error: 'Invalid scan ID' });
+    const scan = await getScanById(scanId);
+    if (!scan) return res.status(404).json({ error: 'Scan not found' });
+    if (scan.user_id !== req.user.id) return res.status(403).json({ error: 'Forbidden' });
+
+    const report = await buildFreePaidBoundaryReport(scan);
+    const pdfBuffer = await generatePaidReportPdf(report);
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="accessibility-report-${scanId}.pdf"`);
+    return res.send(pdfBuffer);
+  } catch (error) {
+    console.error('[API] Failed to generate dashboard report PDF:', error.message);
+    return res.status(500).json({ error: 'Unable to generate report PDF' });
+  }
+});
+
 app.get('/dashboard/scans', requireAuth, async (req, res) => {
   try {
     const scans = await getUserScans(req.user.id);
